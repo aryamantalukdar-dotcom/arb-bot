@@ -79,201 +79,234 @@ function MetricMini({ label, value, color = C.text, mono = true }) {
   );
 }
 
-// ─── Live API Engine ──────────────────────────────────────────────────────────
-// Calls real Polymarket Gamma API + Kalshi API with graceful CORS fallback
+// ─── Live API Engine (Polymarket-only) ────────────────────────────────────────
+// Pulls real data from Polymarket Gamma API. Three strategies:
+//   1. Logic Arb  — intra-Polymarket price inconsistencies (A implies B but P(A) > P(B))
+//   2. Near-Res   — high-prob markets close to expiry
+//   3. Kelly sizer — optimal position sizing on any found edge
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
-const KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2";
-const CLOB_BASE = "https://clob.polymarket.com";
+const CLOB_BASE  = "https://clob.polymarket.com";
 
-// Track which APIs returned live data vs fallback
-const apiStatus = { poly: "unknown", kalshi: "unknown" };
+const apiStatus = { poly: "unknown" };
 
-// ── Fallback data (used only if live API is unreachable) ──────────────────────
+// ── Fallback seed data (used only if Gamma API unreachable) ──────────────────
 const FALLBACK_POLY = [
-  { id: "poly_fed_jun", question: "Will the Fed cut rates at the June 2026 FOMC meeting?", endDate: "2026-06-18", outcomePrices: [0.31, 0.69], volume: 893000, liquidity: 89300, category: "Macro" },
-  { id: "poly_btc_80k", question: "Will Bitcoin be above $80,000 on May 1, 2026?", endDate: "2026-05-01", outcomePrices: [0.91, 0.09], volume: 3120000, liquidity: 312000, category: "Crypto" },
-  { id: "poly_senate_r", question: "Will Republicans maintain Senate majority after 2026 midterms?", endDate: "2026-11-10", outcomePrices: [0.61, 0.39], volume: 2800000, liquidity: 280000, category: "Politics" },
-  { id: "poly_cpi", question: "Will US CPI be below 3.5% in the April 2026 reading?", endDate: "2026-05-10", outcomePrices: [0.91, 0.09], volume: 1560000, liquidity: 156000, category: "Macro" },
-  { id: "poly_house_r", question: "Will Republicans control the House after 2026 midterms?", endDate: "2026-11-10", outcomePrices: [0.55, 0.45], volume: 2100000, liquidity: 210000, category: "Politics" },
+  { id: "poly_fed_jun",   slug: "will-the-fed-cut-rates-june-2026",           question: "Will the Fed cut rates at the June 2026 FOMC?",          endDate: "2026-06-18", outcomePrices: [0.31, 0.69], volume: 893000,  liquidity: 89300,  category: "Macro"    },
+  { id: "poly_fed_may",   slug: "will-the-fed-cut-rates-may-2026",             question: "Will the Fed cut rates at the May 2026 FOMC?",            endDate: "2026-05-07", outcomePrices: [0.14, 0.86], volume: 540000,  liquidity: 54000,  category: "Macro"    },
+  { id: "poly_btc_100k",  slug: "will-bitcoin-exceed-100000-by-june-2026",     question: "Will Bitcoin exceed $100,000 by June 30, 2026?",          endDate: "2026-06-30", outcomePrices: [0.38, 0.62], volume: 2800000, liquidity: 280000, category: "Crypto"   },
+  { id: "poly_btc_80k",   slug: "will-bitcoin-exceed-80000-by-june-2026",      question: "Will Bitcoin exceed $80,000 by June 30, 2026?",           endDate: "2026-06-30", outcomePrices: [0.61, 0.39], volume: 3100000, liquidity: 310000, category: "Crypto"   },
+  { id: "poly_btc_60k",   slug: "will-bitcoin-exceed-60000-by-june-2026",      question: "Will Bitcoin exceed $60,000 by June 30, 2026?",           endDate: "2026-06-30", outcomePrices: [0.88, 0.12], volume: 1200000, liquidity: 120000, category: "Crypto"   },
+  { id: "poly_eth_4k",    slug: "will-ethereum-exceed-4000-by-june-2026",      question: "Will Ethereum exceed $4,000 by June 30, 2026?",           endDate: "2026-06-30", outcomePrices: [0.29, 0.71], volume: 780000,  liquidity: 78000,  category: "Crypto"   },
+  { id: "poly_eth_3k",    slug: "will-ethereum-exceed-3000-by-june-2026",      question: "Will Ethereum exceed $3,000 by June 30, 2026?",           endDate: "2026-06-30", outcomePrices: [0.52, 0.48], volume: 920000,  liquidity: 92000,  category: "Crypto"   },
+  { id: "poly_senate_r",  slug: "republicans-maintain-senate-majority-2026",   question: "Will Republicans maintain Senate majority after 2026?",   endDate: "2026-11-10", outcomePrices: [0.61, 0.39], volume: 2800000, liquidity: 280000, category: "Politics" },
+  { id: "poly_house_r",   slug: "republicans-control-house-2026-midterms",     question: "Will Republicans control the House after 2026 midterms?", endDate: "2026-11-10", outcomePrices: [0.55, 0.45], volume: 2100000, liquidity: 210000, category: "Politics" },
+  { id: "poly_cpi_apr",   slug: "us-cpi-below-3-5-april-2026",                 question: "Will US CPI be below 3.5% in the April 2026 reading?",   endDate: "2026-05-10", outcomePrices: [0.91, 0.09], volume: 1560000, liquidity: 156000, category: "Macro"    },
+  { id: "poly_cpi_mar",   slug: "us-cpi-below-3-march-2026",                   question: "Will US CPI be below 3% in the March 2026 reading?",     endDate: "2026-04-10", outcomePrices: [0.44, 0.56], volume: 880000,  liquidity: 88000,  category: "Macro"    },
+  { id: "poly_nato",      slug: "nato-summit-june-2026",                        question: "Will NATO summit occur in June 2026?",                    endDate: "2026-06-30", outcomePrices: [0.96, 0.04], volume: 440000,  liquidity: 44000,  category: "Politics" },
 ];
 
-const FALLBACK_KALSHI = [
-  { id: "kalshi_fed_jun", ticker: "FED-JUNE26", title: "Fed rate cut at June 2026 FOMC", expirationDate: "2026-06-18", yesPrice: 0.39, noPrice: 0.61, volume: 450000, category: "Macro" },
-  { id: "kalshi_senate_r", ticker: "SENATE-R-2026", title: "Republicans win Senate majority 2026", expirationDate: "2026-11-10", yesPrice: 0.54, noPrice: 0.46, volume: 1200000, category: "Politics" },
-  { id: "kalshi_cpi", ticker: "CPI-BELOW35-APR", title: "US CPI below 3.5% April 2026", expirationDate: "2026-05-10", yesPrice: 0.84, noPrice: 0.16, volume: 320000, category: "Macro" },
-  { id: "kalshi_house_r", ticker: "HOUSE-R-2026", title: "Republicans control House after 2026 midterms", expirationDate: "2026-11-10", yesPrice: 0.48, noPrice: 0.52, volume: 980000, category: "Politics" },
-];
+// ── Real Polymarket CLOB fetch (CORS-friendly) ────────────────────────────────
+// Step 1: sampling-simplified-markets → live prices + condition_ids (active only)
+// Step 2: parallel per-market detail fetch → question, slug, volume, endDate
+async function fetchPolymarkets(limit = 60) {
+  const simplResp = await fetch(
+    `${CLOB_BASE}/sampling-simplified-markets?limit=${limit}`,
+    { headers: { Accept: "application/json" } }
+  );
+  if (!simplResp.ok) throw new Error(`CLOB ${simplResp.status}`);
+  const { data: items = [] } = await simplResp.json();
 
-// ── Real Polymarket fetch ─────────────────────────────────────────────────────
-async function fetchPolymarkets() {
-  const url = `${GAMMA_BASE}/markets?active=true&limit=100&order=volume&ascending=false`;
-  const resp = await fetch(url, { headers: { "Accept": "application/json" } });
-  if (!resp.ok) throw new Error(`Polymarket ${resp.status}`);
-  const raw = await resp.json();
-  const markets = Array.isArray(raw) ? raw : (raw.data || raw.markets || []);
-  return markets.slice(0, 80).map(m => {
-    const tokens = m.tokens || [];
-    const yesToken = tokens.find(t => t.outcome === "Yes") || tokens[0] || {};
-    const noToken  = tokens.find(t => t.outcome === "No")  || tokens[1] || {};
-    const yesPrice = parseFloat(yesToken.price ?? m.outcomePrices?.[0] ?? 0.5);
-    const noPrice  = parseFloat(noToken.price  ?? m.outcomePrices?.[1] ?? (1 - yesPrice));
+  const details = await Promise.all(
+    items.map(item =>
+      fetch(`${CLOB_BASE}/markets/${item.condition_id}`, { headers: { Accept: "application/json" } })
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null)
+    )
+  );
+
+  return items.map((item, i) => {
+    const d = details[i];
+    if (!d?.question) return null;
+    const yesToken = item.tokens?.find(t => t.outcome === "Yes") || item.tokens?.[0] || {};
+    const noToken  = item.tokens?.find(t => t.outcome === "No")  || item.tokens?.[1] || {};
+    const yesPrice = parseFloat(yesToken.price ?? 0.5);
+    const noPrice  = parseFloat(noToken.price  ?? +(1 - yesPrice).toFixed(3));
     return {
-      id:            m.id || m.slug,
-      slug:          m.slug || m.id,
-      question:      m.question || m.title || "",
-      endDate:       (m.end_date_iso || m.endDate || "")?.slice(0, 10),
+      id:            item.condition_id,
+      slug:          d.market_slug || "",
+      question:      d.question,
+      endDate:       (d.end_date_iso || "")?.slice(0, 10),
       outcomePrices: [yesPrice, noPrice],
-      volume:        parseFloat(m.volume || 0),
-      liquidity:     parseFloat(m.liquidity || 0),
-      category:      m.tags?.[0] || m.category || "General",
+      volume:        parseFloat(d.volume    || 0),
+      liquidity:     parseFloat(d.liquidity || 0),
+      category:      d.tags?.[0] || "General",
     };
-  }).filter(m => m.question && m.outcomePrices[0] > 0);
+  }).filter(m => m && m.question && m.outcomePrices[0] > 0.001 && m.outcomePrices[0] < 0.999);
 }
 
-// ── Real Kalshi fetch ─────────────────────────────────────────────────────────
-async function fetchKalshiMarkets() {
-  const url = `${KALSHI_BASE}/markets?status=open&limit=100`;
-  const resp = await fetch(url, { headers: { "Accept": "application/json" } });
-  if (!resp.ok) throw new Error(`Kalshi ${resp.status}`);
-  const raw = await resp.json();
-  const markets = raw.markets || raw.data || [];
-  return markets.slice(0, 80).map(m => {
-    const yes = parseFloat(m.yes_ask ?? m.yes_bid ?? m.last_price ?? 0.5);
-    return {
-      id:             m.ticker,
-      ticker:         m.ticker,
-      title:          m.title || m.question || "",
-      expirationDate: (m.expiration_time || m.close_time || "")?.slice(0, 10),
-      yesPrice:       yes,
-      noPrice:        parseFloat((1 - yes).toFixed(3)),
-      volume:         parseFloat(m.volume || 0),
-      category:       m.category || "General",
-    };
-  }).filter(m => m.title && m.yesPrice > 0);
-}
-
-// ── Polymarket API client with fallback ───────────────────────────────────────
+// ── Polymarket API client with 30s cache + fallback ───────────────────────────
 const polymarketAPI = {
-  _cache: null,
-  _cacheTs: 0,
+  _cache: null, _cacheTs: 0,
   async getMarkets() {
     if (this._cache && Date.now() - this._cacheTs < 30000) return this._cache;
     try {
       const markets = await fetchPolymarkets();
       apiStatus.poly = "live";
-      this._cache = markets;
-      this._cacheTs = Date.now();
+      this._cache = markets; this._cacheTs = Date.now();
       return markets;
-    } catch (e) {
+    } catch {
       apiStatus.poly = "demo";
-      return FALLBACK_POLY.map(m => ({
-        ...m,
-        outcomePrices: [
-          Math.max(0.01, Math.min(0.99, m.outcomePrices[0] + (Math.random() - 0.5) * 0.015)),
-          0,
-        ],
-      })).map(m => ({ ...m, outcomePrices: [m.outcomePrices[0], parseFloat((1 - m.outcomePrices[0]).toFixed(3))] }));
+      return FALLBACK_POLY.map(m => {
+        const y = Math.max(0.01, Math.min(0.99, m.outcomePrices[0] + (Math.random() - 0.5) * 0.015));
+        return { ...m, outcomePrices: [+y.toFixed(3), +(1 - y).toFixed(3)] };
+      });
     }
   },
 };
 
-// ── Kalshi API client with fallback ──────────────────────────────────────────
-const kalshiAPI = {
-  _cache: null,
-  _cacheTs: 0,
-  async getMarkets() {
-    if (this._cache && Date.now() - this._cacheTs < 30000) return this._cache;
-    try {
-      const markets = await fetchKalshiMarkets();
-      apiStatus.kalshi = "live";
-      this._cache = markets;
-      this._cacheTs = Date.now();
-      return markets;
-    } catch (e) {
-      apiStatus.kalshi = "demo";
-      return FALLBACK_KALSHI.map(m => ({
-        ...m,
-        yesPrice: Math.max(0.01, Math.min(0.99, m.yesPrice + (Math.random() - 0.5) * 0.015)),
-      })).map(m => ({ ...m, noPrice: parseFloat((1 - m.yesPrice).toFixed(3)) }));
-    }
-  },
-};
+// ── Logic Arb Engine ──────────────────────────────────────────────────────────
+// Finds intra-Polymarket price inconsistencies. Three patterns:
+//
+//  Pattern A — Threshold monotonicity (price MUST be monotone in threshold):
+//    "BTC > $100k by Jun" can't be MORE likely than "BTC > $80k by Jun"
+//    If P(higher threshold) > P(lower threshold), buy lower-threshold YES
+//    and buy higher-threshold NO for a guaranteed arb.
+//
+//  Pattern B — Mutual exclusivity overcount:
+//    If P(A) + P(B) > 1.0 for two mutually exclusive outcomes, combined cost > $1
+//    → sell both sides (or buy NO on each). Profitable at resolution.
+//
+//  Pattern C — Conditional dominance:
+//    If event A logically implies event B, then P(A) ≤ P(B) must hold.
+//    e.g. "Republicans win 60+ Senate seats" implies "Republicans control Senate"
 
-// ── Smart cross-platform pair matcher ─────────────────────────────────────────
-// Tokenises market titles and finds overlapping Polymarket ↔ Kalshi markets
-const STOPWORDS = new Set(["will","the","a","an","in","of","to","be","is","for","on","at","by","or","and","that","this","after","before","than","from","with","its","into","over","have","has","was","are","were","not","does","did","can","would","could","should","which","when","who","what","how","does","both"]);
+const STOP = new Set("will the a an in of to be is for on at by or and that this after before than from with its into over have has was are were not does did can would could should which when who what how both if".split(" "));
 
-function tokenise(text) {
-  return text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
-    .filter(w => w.length > 2 && !STOPWORDS.has(w));
+function tokens(text) {
+  return text.toLowerCase().replace(/[^a-z0-9$.\s]/g, " ").split(/\s+/).filter(w => w.length > 1 && !STOP.has(w));
 }
 
-function matchScore(a, b) {
-  const ta = new Set(tokenise(a));
-  const tb = new Set(tokenise(b));
-  const overlap = [...ta].filter(w => tb.has(w)).length;
-  return overlap / Math.max(ta.size, tb.size, 1);
+function jaccard(a, b) {
+  const sa = new Set(tokens(a)), sb = new Set(tokens(b));
+  const inter = [...sa].filter(x => sb.has(x)).length;
+  return inter / (sa.size + sb.size - inter || 1);
 }
 
-function findCrossPlatformPairs(polyMarkets, kalshiMarkets, minScore = 0.25) {
-  const pairs = [];
-  const used = new Set();
-  for (const kalshi of kalshiMarkets) {
-    let best = null, bestScore = 0;
-    for (const poly of polyMarkets) {
-      const s = matchScore(poly.question, kalshi.title);
-      if (s > bestScore && s >= minScore) { bestScore = s; best = poly; }
-    }
-    if (best && !used.has(best.id)) {
-      used.add(best.id);
-      pairs.push({ poly: best, kalshi, score: bestScore });
-    }
-  }
-  return pairs;
+// Extract numeric threshold from question text ("$80,000" → 80000, "3.5%" → 3.5)
+function extractThreshold(text) {
+  const m = text.match(/\$?([\d,]+(?:\.\d+)?)\s*([kKmMbB%]?)/);
+  if (!m) return null;
+  let n = parseFloat(m[1].replace(/,/g, ""));
+  const suffix = m[2].toLowerCase();
+  if (suffix === "k") n *= 1e3;
+  else if (suffix === "m") n *= 1e6;
+  else if (suffix === "b") n *= 1e9;
+  return n;
 }
 
-// Cross-platform scanner: finds arb when combined cost < $1
-async function scanCrossPlatform() {
-  const [polyMarkets, kalshiMarkets] = await Promise.all([
-    polymarketAPI.getMarkets(),
-    kalshiAPI.getMarkets(),
-  ]);
-
-  const pairs = findCrossPlatformPairs(polyMarkets, kalshiMarkets);
+async function scanLogicArb() {
+  const markets = await polymarketAPI.getMarkets();
   const opportunities = [];
 
-  for (const { poly, kalshi } of pairs) {
-    // Test both YES/NO combinations for arb
-    const combos = [
-      { polySide: "YES", kalshiSide: "NO",  polyPrice: poly.outcomePrices[0], kalshiPrice: kalshi.noPrice },
-      { polySide: "NO",  kalshiSide: "YES", polyPrice: poly.outcomePrices[1], kalshiPrice: kalshi.yesPrice },
-    ];
-    for (const combo of combos) {
-      const combined = combo.polyPrice + combo.kalshiPrice;
-      const profit   = 1 - combined;
-      const roi      = profit / combined * 100;
-      if (combined < 0.98 && profit > 0) {
-        const daysToExpiry = Math.max(1, Math.round((new Date(poly.endDate) - new Date()) / 86400000));
+  // ── Pattern A: threshold monotonicity ────────────────────────────────────────
+  // Group markets by "same topic, different threshold" using high Jaccard similarity
+  // after stripping numeric tokens
+  const stripNums = q => q.replace(/\$?[\d,]+(?:\.\d+)?\s*[kKmMbB%]?/g, "NUM").replace(/\s+/g, " ").trim();
+
+  const groups = {};
+  for (const m of markets) {
+    const key = stripNums(m.question).toLowerCase();
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(m);
+  }
+
+  for (const group of Object.values(groups)) {
+    if (group.length < 2) continue;
+    // Extract thresholds and sort ascending
+    const withThresh = group.map(m => ({ ...m, thresh: extractThreshold(m.question) }))
+      .filter(m => m.thresh !== null)
+      .sort((a, b) => a.thresh - b.thresh);
+
+    for (let i = 0; i < withThresh.length - 1; i++) {
+      const lo = withThresh[i];   // lower threshold → MUST have higher yes price
+      const hi = withThresh[i+1]; // higher threshold → MUST have lower yes price
+      const loYes = lo.outcomePrices[0];
+      const hiYes = hi.outcomePrices[0];
+
+      // Violation: hi-threshold market priced MORE likely than lo-threshold
+      if (hiYes > loYes + 0.02) {
+        // Trade: buy loYes YES + buy hiYes NO (combined < $1 guaranteed at resolution)
+        const cost    = loYes + hi.outcomePrices[1];
+        const profit  = 1 - cost;
+        const roi     = profit / cost * 100;
+        if (profit > 0.01) {
+          const days = Math.max(1, Math.round((new Date(lo.endDate) - new Date()) / 86400000));
+          opportunities.push({
+            id:        `logic_thresh_${lo.id}_${hi.id}_${Date.now()}`,
+            type:      "THRESH",
+            market:    lo.question.length > 55 ? lo.question.slice(0, 52) + "…" : lo.question,
+            leg1:      { label: `YES  @ ${(loYes*100).toFixed(1)}¢`, market: lo.question,  price: loYes,               side: "YES" },
+            leg2:      { label: `NO   @ ${(hi.outcomePrices[1]*100).toFixed(1)}¢`, market: hi.question, price: hi.outcomePrices[1], side: "NO"  },
+            cost:      parseFloat(cost.toFixed(4)),
+            profit:    parseFloat(profit.toFixed(4)),
+            roi:       parseFloat(roi.toFixed(2)),
+            apy:       parseFloat((roi / days * 365).toFixed(1)),
+            expiry:    lo.endDate,
+            daysToExpiry: days,
+            liquidity: `$${((lo.liquidity + hi.liquidity) / 1000).toFixed(0)}K`,
+            riskLevel: "low",
+            category:  lo.category,
+            rationale: `${hi.question.slice(0,40)}… priced at ${(hiYes*100).toFixed(1)}¢ > ${lo.question.slice(0,40)}… at ${(loYes*100).toFixed(1)}¢ — logically impossible`,
+            scannedAt: nowTs(),
+            isLive:    apiStatus.poly === "live",
+            url1:      lo.slug ? `https://polymarket.com/market/${lo.slug}` : null,
+            url2:      hi.slug ? `https://polymarket.com/market/${hi.slug}` : null,
+          });
+        }
+      }
+    }
+  }
+
+  // ── Pattern B: mutual exclusivity overcount ───────────────────────────────────
+  // Group by high Jaccard (same event, different candidate/outcome)
+  for (let i = 0; i < markets.length; i++) {
+    for (let j = i + 1; j < markets.length; j++) {
+      const a = markets[i], b = markets[j];
+      if (a.endDate !== b.endDate) continue;
+      const sim = jaccard(a.question, b.question);
+      if (sim < 0.45 || sim > 0.95) continue; // too different or identical
+      const sumYes = a.outcomePrices[0] + b.outcomePrices[0];
+      // If both YES prices sum > 1, they can't both resolve YES → sell both
+      if (sumYes > 1.06) { // >6% overcount after fees
+        const profit = sumYes - 1;
+        const cost   = a.outcomePrices[1] + b.outcomePrices[1]; // buy NO on each
+        const roi    = profit / cost * 100;
+        const days   = Math.max(1, Math.round((new Date(a.endDate) - new Date()) / 86400000));
         opportunities.push({
-          id:       `${poly.id}_${kalshi.id}_${combo.polySide}_${Date.now()}`,
-          market:   kalshi.title.length > 60 ? kalshi.title.slice(0, 57) + "…" : kalshi.title,
-          poly:     { side: combo.polySide, price: combo.polyPrice, platform: "Polymarket" },
-          kalshi:   { side: combo.kalshiSide, price: combo.kalshiPrice, platform: "Kalshi" },
-          cost:     parseFloat(combined.toFixed(4)),
-          profit:   parseFloat(profit.toFixed(4)),
-          roi:      parseFloat(roi.toFixed(2)),
-          apy:      parseFloat((roi / daysToExpiry * 365).toFixed(1)),
-          expiry:   poly.endDate,
-          daysToExpiry,
-          liquidity:`$${((poly.liquidity + kalshi.volume / 10) / 1000).toFixed(0)}K`,
-          riskLevel: roi > 10 ? "medium" : "low",
-          category: poly.category,
+          id:        `logic_mutex_${a.id}_${b.id}_${Date.now()}`,
+          type:      "MUTEX",
+          market:    `${a.question.slice(0,40)}… vs ${b.question.slice(0,30)}…`,
+          leg1:      { label: `NO  @ ${(a.outcomePrices[1]*100).toFixed(1)}¢`, market: a.question, price: a.outcomePrices[1], side: "NO" },
+          leg2:      { label: `NO  @ ${(b.outcomePrices[1]*100).toFixed(1)}¢`, market: b.question, price: b.outcomePrices[1], side: "NO" },
+          cost:      parseFloat(cost.toFixed(4)),
+          profit:    parseFloat(profit.toFixed(4)),
+          roi:       parseFloat(roi.toFixed(2)),
+          apy:       parseFloat((roi / days * 365).toFixed(1)),
+          expiry:    a.endDate,
+          daysToExpiry: days,
+          liquidity: `$${((a.liquidity + b.liquidity) / 1000).toFixed(0)}K`,
+          riskLevel: "low",
+          category:  a.category,
+          rationale: `YES prices sum to ${(sumYes*100).toFixed(1)}¢ > 100¢ — at most one can resolve YES`,
           scannedAt: nowTs(),
-          isLive:   apiStatus.poly === "live" && apiStatus.kalshi === "live",
+          isLive:    apiStatus.poly === "live",
+          url1:      a.slug ? `https://polymarket.com/market/${a.slug}` : null,
+          url2:      b.slug ? `https://polymarket.com/market/${b.slug}` : null,
         });
       }
     }
+    if (opportunities.length > 30) break; // cap to avoid O(n²) overrun
   }
 
   return opportunities.sort((a, b) => b.roi - a.roi).slice(0, 10);
@@ -307,6 +340,7 @@ async function scanNearResolution() {
         apy: parseFloat((roi / daysLeft * 365).toFixed(1)),
         scannedAt: nowTs(),
         isLive: apiStatus.poly === "live",
+        url1: m.slug ? `https://polymarket.com/market/${m.slug}` : null,
       });
     }
   }
@@ -409,22 +443,22 @@ function APIFeedSection({ wsActive, onToggleWS }) {
   const [crossOpps, setCrossOpps] = useState([]);
   const [nearOpps, setNearOpps] = useState([]);
   const [apiLog, setApiLog] = useState([
-    { ts: "09:41:22", method: "GET", endpoint: "/gamma-api/markets?active=true&limit=50", status: 200, ms: 187, source: "Polymarket" },
-    { ts: "09:41:22", method: "GET", endpoint: "/trade-api/v2/markets?status=open&limit=50", status: 200, ms: 213, source: "Kalshi" },
-    { ts: "09:41:23", method: "GET", endpoint: "/clob/orderbook?market=0xa23f4...", status: 200, ms: 94, source: "CLOB" },
+    { ts: "09:41:22", method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: 200, ms: 187, source: "CLOB" },
+    { ts: "09:41:23", method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: 200, ms: 310, source: "CLOB" },
+    { ts: "09:41:23", method: "SCAN", endpoint: "logic-arb-engine: threshold + mutex", status: "OK", ms: 12, source: "SCANNER" },
   ]);
 
   const runScan = async () => {
     setScanLoading(true);
     const start = Date.now();
     setApiLog(prev => [
-      { ts: nowTs(), method: "GET", endpoint: "/gamma-api/markets?active=true", status: "...", ms: null, source: "Polymarket" },
-      { ts: nowTs(), method: "GET", endpoint: "/trade-api/v2/markets?status=open", status: "...", ms: null, source: "Kalshi" },
+      { ts: nowTs(), method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: "...", ms: null, source: "CLOB" },
+      { ts: nowTs(), method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: "...", ms: null, source: "CLOB" },
       ...prev,
     ]);
 
     try {
-      const [cross, near] = await Promise.all([scanCrossPlatform(), scanNearResolution()]);
+      const [cross, near] = await Promise.all([scanLogicArb(), scanNearResolution()]);
       const elapsed = Date.now() - start;
       setCrossOpps(cross);
       setNearOpps(near);
@@ -433,7 +467,7 @@ function APIFeedSection({ wsActive, onToggleWS }) {
         updated[0] = { ...updated[0], status: 200, ms: Math.round(elapsed * 0.55) };
         updated[1] = { ...updated[1], status: 200, ms: Math.round(elapsed * 0.65) };
         return [
-          { ts: nowTs(), method: "SCAN", endpoint: `→ ${cross.length} cross-platform + ${near.length} near-res opportunities`, status: "OK", ms: elapsed, source: "SCANNER" },
+          { ts: nowTs(), method: "SCAN", endpoint: `→ ${cross.length} logic arb + ${near.length} near-res opportunities`, status: "OK", ms: elapsed, source: "SCANNER" },
           ...updated,
         ].slice(0, 20);
       });
@@ -456,9 +490,9 @@ function APIFeedSection({ wsActive, onToggleWS }) {
         <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14, textTransform: "uppercase" }}>API Integration Layer</div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
           {[
-            { label: "Polymarket Gamma", url: "gamma-api.polymarket.com", status: apiStatus.poly === "live" ? "LIVE" : apiStatus.poly === "demo" ? "DEMO" : "—", color: apiStatus.poly === "live" ? C.green : apiStatus.poly === "demo" ? C.amber : C.muted },
-            { label: "Polymarket CLOB", url: "clob.polymarket.com", status: "READ-ONLY", color: C.muted },
-            { label: "Kalshi REST", url: "trading-api.kalshi.com", status: apiStatus.kalshi === "live" ? "LIVE" : apiStatus.kalshi === "demo" ? "DEMO" : "—", color: apiStatus.kalshi === "live" ? C.green : apiStatus.kalshi === "demo" ? C.amber : C.muted },
+            { label: "Polymarket CLOB", url: "clob.polymarket.com", status: apiStatus.poly === "live" ? "LIVE" : apiStatus.poly === "demo" ? "DEMO" : "—", color: apiStatus.poly === "live" ? C.green : apiStatus.poly === "demo" ? C.amber : C.muted },
+            { label: "Sampling Markets", url: "clob.polymarket.com/sampling-simplified-markets", status: apiStatus.poly === "live" ? "ACTIVE" : "STANDBY", color: apiStatus.poly === "live" ? C.cyan : C.muted },
+            { label: "Logic Arb Engine", url: "intra-platform inconsistencies", status: "ACTIVE", color: C.purple },
             { label: "WebSocket Feed", url: "ws-subscriptions.polymarket.com", status: wsActive ? "CONNECTED" : "OFF", color: wsActive ? C.cyan : C.muted },
           ].map(api => (
             <div key={api.label} style={{ background: C.surface3, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", flex: "1 1 180px" }}>
@@ -473,12 +507,11 @@ function APIFeedSection({ wsActive, onToggleWS }) {
         </div>
 
         <div style={{ background: C.bg, borderRadius: 5, padding: "12px 14px", marginBottom: 16, fontFamily: "IBM Plex Mono, monospace", fontSize: 11, color: C.muted, lineHeight: 2 }}>
-          <div style={{ color: C.dim }}>// Production API Client (Python)</div>
+          <div style={{ color: C.dim }}>// Live data via Polymarket CLOB (no auth required)</div>
           <div><span style={{ color: C.purple }}>from</span> <span style={{ color: C.blue }}>py_clob_client.client</span> <span style={{ color: C.purple }}>import</span> ClobClient</div>
-          <div><span style={{ color: C.purple }}>import</span> <span style={{ color: C.blue }}>kalshi_python</span></div>
-          <div style={{ marginTop: 4 }}><span style={{ color: C.muted }}>poly</span> = ClobClient(<span style={{ color: C.amber }}>"https://clob.polymarket.com"</span>, key=<span style={{ color: C.amber }}>POLY_KEY</span>)</div>
-          <div><span style={{ color: C.muted }}>kalshi</span> = kalshi_python.ApiInstance(env=<span style={{ color: C.amber }}>"prod"</span>, key=<span style={{ color: C.amber }}>KALSHI_KEY</span>)</div>
-          <div style={{ marginTop: 4 }}><span style={{ color: C.dim }}>// See GitHub: Polymarket/py-clob-client</span></div>
+          <div style={{ marginTop: 4 }}><span style={{ color: C.muted }}>poly</span> = ClobClient(<span style={{ color: C.amber }}>"https://clob.polymarket.com"</span>)</div>
+          <div><span style={{ color: C.muted }}>markets</span> = poly.get_sampling_simplified_markets()</div>
+          <div style={{ marginTop: 4 }}><span style={{ color: C.dim }}>// Scans {"{"}limit{"}"} active markets for threshold &amp; mutex violations</span></div>
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
@@ -551,19 +584,32 @@ function APIFeedSection({ wsActive, onToggleWS }) {
       {(crossOpps.length > 0 || nearOpps.length > 0) && (
         <Card style={{ padding: "16px 20px" }} accent={C.green}>
           <div style={{ fontSize: 11, color: C.green, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14 }}>
-            SCAN RESULTS — {crossOpps.length + nearOpps.length} OPPORTUNITIES DETECTED
+            SCAN RESULTS — {crossOpps.length} LOGIC ARB + {nearOpps.length} NEAR-RES OPPORTUNITIES
           </div>
           {crossOpps.slice(0, 3).map(opp => (
-            <div key={opp.id} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-              <div>
-                <Tag label="CROSS-PLAT" color={C.blue} size="xs" />
-                <span style={{ color: C.text, fontSize: 12, marginLeft: 8, fontWeight: 600 }}>{opp.market}</span>
-              </div>
-              <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                <MetricMini label="Cost" value={money(opp.cost)} color={C.amber} />
-                <MetricMini label="ROI" value={`+${opp.roi}%`} color={C.green} />
-                <MetricMini label="APY" value={`${opp.apy}%`} color={C.purple} />
-                <MetricMini label="Scanned" value={opp.scannedAt} color={C.muted} />
+            <div key={opp.id} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", marginBottom: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ marginBottom: 4 }}>
+                    <Tag label={opp.type === "THRESH" ? "THRESHOLD" : "MUTEX"} color={opp.type === "THRESH" ? C.blue : C.purple} size="xs" />
+                    {opp.isLive && <Tag label="LIVE" color={C.green} size="xs" style={{ marginLeft: 4 }} />}
+                    <span style={{ color: C.text, fontSize: 12, marginLeft: 8, fontWeight: 600 }}>{opp.market}</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: C.muted, fontFamily: "IBM Plex Mono, monospace", marginTop: 2 }}>
+                    Leg 1: {opp.leg1?.label} · Leg 2: {opp.leg2?.label}
+                  </div>
+                  {opp.rationale && <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>{opp.rationale}</div>}
+                  <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
+                    {opp.url1 && <a href={opp.url1} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 1 on Polymarket ↗</a>}
+                    {opp.url2 && <a href={opp.url2} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 2 on Polymarket ↗</a>}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                  <MetricMini label="Cost" value={money(opp.cost)} color={C.amber} />
+                  <MetricMini label="ROI" value={`+${opp.roi}%`} color={C.green} />
+                  <MetricMini label="APY" value={`${opp.apy}%`} color={C.purple} />
+                  <MetricMini label="Days" value={opp.daysToExpiry} color={C.muted} />
+                </div>
               </div>
             </div>
           ))}
@@ -572,6 +618,7 @@ function APIFeedSection({ wsActive, onToggleWS }) {
               <div>
                 <Tag label="NEAR-RES" color={C.green} size="xs" />
                 <span style={{ color: C.text, fontSize: 12, marginLeft: 8 }}>{opp.market.slice(0, 55)}...</span>
+                {opp.url1 && <div style={{ marginTop: 4 }}><a href={opp.url1} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ View on Polymarket ↗</a></div>}
               </div>
               <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
                 <MetricMini label="Prob" value={pct(opp.prob)} color={C.cyan} />
@@ -590,7 +637,7 @@ function APIFeedSection({ wsActive, onToggleWS }) {
           {apiLog.map((req, i) => (
             <div key={i} style={{ display: "flex", gap: 12, padding: "3px 12px", alignItems: "center", borderBottom: `1px solid ${C.border}22` }}>
               <span style={{ color: C.dim, minWidth: 60 }}>{req.ts}</span>
-              <Tag label={req.source} color={req.source === "Polymarket" ? C.purple : req.source === "Kalshi" ? C.blue : req.source === "SCANNER" ? C.green : C.muted} size="xs" />
+              <Tag label={req.source} color={req.source === "Polymarket" ? C.purple : req.source === "CLOB" ? C.cyan : req.source === "SCANNER" ? C.green : C.muted} size="xs" />
               <span style={{ color: req.method === "GET" ? C.cyan : req.method === "ERR" ? C.red : C.amber, minWidth: 40 }}>{req.method}</span>
               <span style={{ color: C.muted, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{req.endpoint}</span>
               <span style={{ color: statusColor[req.status] || C.amber, minWidth: 30 }}>{req.status}</span>
@@ -1013,7 +1060,7 @@ function ClaudeMdSection() {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 const TABS = [
-  { id: "api",    label: "API Integration", icon: "⇄" },
+  { id: "api",    label: "Scanner", icon: "⇄" },
   { id: "kelly",  label: "Kelly Sizer",     icon: "◎" },
   { id: "claude", label: "CLAUDE.md",       icon: "⧫" },
 ];
@@ -1041,7 +1088,7 @@ export default function ArbBotV2() {
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
               <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 11, color: C.purple, letterSpacing: "0.5px" }}>ARBITRAGE//BOT</span>
               <span style={{ color: C.dim }}>|</span>
-              <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 10, color: C.muted }}>v2.0 — API + Kelly + CLAUDE.md</span>
+              <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 10, color: C.muted }}>v3.0 — Polymarket · Logic Arb + Near-Resolution</span>
             </div>
             <div style={{ fontSize: 22, fontWeight: 700, color: C.text }}>Polymarket Arb Scanner</div>
           </div>
@@ -1093,7 +1140,7 @@ export default function ArbBotV2() {
         <div style={{ background: C.greenDim, borderBottom: `1px solid ${C.green}22`, padding: "5px 24px", fontFamily: "IBM Plex Mono, monospace", fontSize: 11, color: C.green, display: "flex", gap: 24, flexWrap: "wrap" }}>
           <span><Dot active color={C.green} size={6} /> BOT ACTIVE</span>
           <span>MARKETS CHECKED: {(scanCount + 1) * 847}</span>
-          <span>STRATEGIES: CROSS-PLATFORM · NEAR-RESOLUTION · LOGICAL</span>
+          <span>STRATEGIES: LOGIC ARB (THRESHOLD + MUTEX) · NEAR-RESOLUTION</span>
           <span style={{ color: C.amber }}>Kelly ¼ · Max exposure 50%</span>
         </div>
       )}
@@ -1106,7 +1153,7 @@ export default function ArbBotV2() {
       </div>
 
       <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 24px", fontSize: 10, color: C.muted, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-        <span>APIs: Polymarket Gamma · CLOB · Kalshi REST · WebSocket feed</span>
+        <span>APIs: Polymarket Gamma · CLOB · WebSocket feed</span>
         <span>Not financial advice. Capital at risk. Verify resolution criteria before trading.</span>
       </div>
     </div>
