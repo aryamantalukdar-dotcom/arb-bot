@@ -33,7 +33,7 @@ const money = (n, d = 2) => `$${fmt(n, d)}`;
 const nowTs = () => { const d = new Date(); return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}`; };
 
 const RISK_COLOR = { low: C.green, medium: C.amber, high: C.red, critical: C.red };
-const TYPE_COLOR = { CROSS_PLAT: C.blue, NEAR_RES: C.green, LOGIC: C.purple, KELLY: C.amber };
+const TYPE_COLOR = { LOGIC_ARB: C.blue, NEAR_RES: C.green, LOGIC: C.purple, KELLY: C.amber };
 
 function Tag({ label, color = C.muted, size = "sm" }) {
   return (
@@ -85,10 +85,7 @@ function MetricMini({ label, value, color = C.text, mono = true }) {
 //   2. Near-Res   — high-prob markets close to expiry
 //   3. Kelly sizer — optimal position sizing on any found edge
 
-const GAMMA_BASE = "https://gamma-api.polymarket.com";
-const CLOB_BASE  = "https://clob.polymarket.com";
-
-const apiStatus = { poly: "unknown" };
+const CLOB_BASE = "https://clob.polymarket.com";
 
 // ── Fallback seed data (used only if Gamma API unreachable) ──────────────────
 const FALLBACK_POLY = [
@@ -128,10 +125,18 @@ async function fetchPolymarkets(limit = 60) {
   return items.map((item, i) => {
     const d = details[i];
     if (!d?.question) return null;
-    const yesToken = item.tokens?.find(t => t.outcome === "Yes") || item.tokens?.[0] || {};
-    const noToken  = item.tokens?.find(t => t.outcome === "No")  || item.tokens?.[1] || {};
-    const yesPrice = parseFloat(yesToken.price ?? 0.5);
-    const noPrice  = parseFloat(noToken.price  ?? +(1 - yesPrice).toFixed(3));
+    // Strict binary YES/NO matching. Non-binary markets are skipped — the old
+    // index-0/index-1 fallback silently treated multi-outcome markets as binary.
+    const tks = Array.isArray(item.tokens) ? item.tokens : [];
+    const yesToken = tks.find(t => String(t.outcome).toLowerCase() === "yes");
+    const noToken  = tks.find(t => String(t.outcome).toLowerCase() === "no");
+    if (!yesToken || !noToken) return null;
+    const yesPrice = parseFloat(yesToken.price);
+    const noPrice  = parseFloat(noToken.price);
+    if (!Number.isFinite(yesPrice) || !Number.isFinite(noPrice)) return null;
+    // Polymarket exposes mutex grouping via negRiskMarketID; gamma also surfaces
+    // events[0].id. Either is usable as a group key — Jaccard text similarity is not.
+    const eventId = d.negRiskMarketID || d.neg_risk_market_id || d.event_id || d.events?.[0]?.id || null;
     return {
       id:            item.condition_id,
       slug:          d.market_slug || "",
@@ -141,26 +146,34 @@ async function fetchPolymarkets(limit = 60) {
       volume:        parseFloat(d.volume    || 0),
       liquidity:     parseFloat(d.liquidity || 0),
       category:      d.tags?.[0] || "General",
+      eventId,
     };
   }).filter(m => m && m.question && m.outcomePrices[0] > 0.001 && m.outcomePrices[0] < 0.999);
 }
 
 // ── Polymarket API client with 30s cache + fallback ───────────────────────────
+// Returns { markets, status } so the caller can lift status into React state.
 const polymarketAPI = {
-  _cache: null, _cacheTs: 0,
+  _cache: null, _cacheTs: 0, _cacheStatus: "unknown",
   async getMarkets() {
-    if (this._cache && Date.now() - this._cacheTs < 30000) return this._cache;
+    if (this._cache && Date.now() - this._cacheTs < 30000) {
+      return { markets: this._cache, status: this._cacheStatus };
+    }
     try {
       const markets = await fetchPolymarkets();
-      apiStatus.poly = "live";
-      this._cache = markets; this._cacheTs = Date.now();
-      return markets;
+      this._cache = markets;
+      this._cacheTs = Date.now();
+      this._cacheStatus = "live";
+      return { markets, status: "live" };
     } catch {
-      apiStatus.poly = "demo";
-      return FALLBACK_POLY.map(m => {
+      const fallback = FALLBACK_POLY.map(m => {
         const y = Math.max(0.01, Math.min(0.99, m.outcomePrices[0] + (Math.random() - 0.5) * 0.015));
-        return { ...m, outcomePrices: [+y.toFixed(3), +(1 - y).toFixed(3)] };
+        return { ...m, outcomePrices: [+y.toFixed(3), +(1 - y).toFixed(3)], eventId: null };
       });
+      this._cache = fallback;
+      this._cacheTs = Date.now();
+      this._cacheStatus = "demo";
+      return { markets: fallback, status: "demo" };
     }
   },
 };
@@ -181,18 +194,6 @@ const polymarketAPI = {
 //    If event A logically implies event B, then P(A) ≤ P(B) must hold.
 //    e.g. "Republicans win 60+ Senate seats" implies "Republicans control Senate"
 
-const STOP = new Set("will the a an in of to be is for on at by or and that this after before than from with its into over have has was are were not does did can would could should which when who what how both if".split(" "));
-
-function tokens(text) {
-  return text.toLowerCase().replace(/[^a-z0-9$.\s]/g, " ").split(/\s+/).filter(w => w.length > 1 && !STOP.has(w));
-}
-
-function jaccard(a, b) {
-  const sa = new Set(tokens(a)), sb = new Set(tokens(b));
-  const inter = [...sa].filter(x => sb.has(x)).length;
-  return inter / (sa.size + sb.size - inter || 1);
-}
-
 // Extract numeric threshold from question text ("$80,000" → 80000, "3.5%" → 3.5)
 function extractThreshold(text) {
   const m = text.match(/\$?([\d,]+(?:\.\d+)?)\s*([kKmMbB%]?)/);
@@ -206,7 +207,8 @@ function extractThreshold(text) {
 }
 
 async function scanLogicArb() {
-  const markets = await polymarketAPI.getMarkets();
+  const { markets, status } = await polymarketAPI.getMarkets();
+  const isLive = status === "live";
   const opportunities = [];
 
   // ── Pattern A: threshold monotonicity ────────────────────────────────────────
@@ -259,7 +261,7 @@ async function scanLogicArb() {
             category:  lo.category,
             rationale: `${hi.question.slice(0,40)}… priced at ${(hiYes*100).toFixed(1)}¢ > ${lo.question.slice(0,40)}… at ${(loYes*100).toFixed(1)}¢ — logically impossible`,
             scannedAt: nowTs(),
-            isLive:    apiStatus.poly === "live",
+            isLive,
             url1:      lo.slug ? `https://polymarket.com/market/${lo.slug}` : null,
             url2:      hi.slug ? `https://polymarket.com/market/${hi.slug}` : null,
           });
@@ -269,52 +271,57 @@ async function scanLogicArb() {
   }
 
   // ── Pattern B: mutual exclusivity overcount ───────────────────────────────────
-  // Group by high Jaccard (same event, different candidate/outcome)
-  for (let i = 0; i < markets.length; i++) {
-    for (let j = i + 1; j < markets.length; j++) {
-      const a = markets[i], b = markets[j];
-      if (a.endDate !== b.endDate) continue;
-      const sim = jaccard(a.question, b.question);
-      if (sim < 0.45 || sim > 0.95) continue; // too different or identical
-      const sumYes = a.outcomePrices[0] + b.outcomePrices[0];
-      // If both YES prices sum > 1, they can't both resolve YES → sell both
-      if (sumYes > 1.06) { // >6% overcount after fees
-        const profit = sumYes - 1;
-        const cost   = a.outcomePrices[1] + b.outcomePrices[1]; // buy NO on each
-        const roi    = profit / cost * 100;
-        const days   = Math.max(1, Math.round((new Date(a.endDate) - new Date()) / 86400000));
-        opportunities.push({
-          id:        `logic_mutex_${a.id}_${b.id}_${Date.now()}`,
-          type:      "MUTEX",
-          market:    `${a.question.slice(0,40)}… vs ${b.question.slice(0,30)}…`,
-          leg1:      { label: `NO  @ ${(a.outcomePrices[1]*100).toFixed(1)}¢`, market: a.question, price: a.outcomePrices[1], side: "NO" },
-          leg2:      { label: `NO  @ ${(b.outcomePrices[1]*100).toFixed(1)}¢`, market: b.question, price: b.outcomePrices[1], side: "NO" },
-          cost:      parseFloat(cost.toFixed(4)),
-          profit:    parseFloat(profit.toFixed(4)),
-          roi:       parseFloat(roi.toFixed(2)),
-          apy:       parseFloat((roi / days * 365).toFixed(1)),
-          expiry:    a.endDate,
-          daysToExpiry: days,
-          liquidity: `$${((a.liquidity + b.liquidity) / 1000).toFixed(0)}K`,
-          riskLevel: "low",
-          category:  a.category,
-          rationale: `YES prices sum to ${(sumYes*100).toFixed(1)}¢ > 100¢ — at most one can resolve YES`,
-          scannedAt: nowTs(),
-          isLive:    apiStatus.poly === "live",
-          url1:      a.slug ? `https://polymarket.com/market/${a.slug}` : null,
-          url2:      b.slug ? `https://polymarket.com/market/${b.slug}` : null,
-        });
-      }
-    }
-    if (opportunities.length > 30) break; // cap to avoid O(n²) overrun
+  // Group by Polymarket eventId / negRiskMarketID — markets sharing one are by
+  // construction mutually exclusive. Text-similarity heuristics (e.g. Jaccard)
+  // produce false positives like "Republicans control Senate" + "Republicans
+  // control House", which are not mutex.
+  const eventGroups = {};
+  for (const m of markets) {
+    if (!m.eventId) continue;
+    (eventGroups[m.eventId] ||= []).push(m);
+  }
+  for (const group of Object.values(eventGroups)) {
+    if (group.length < 2) continue;
+    const sumYes = group.reduce((s, m) => s + m.outcomePrices[0], 0);
+    if (sumYes <= 1.02) continue; // require >2% overcount before claiming arb
+    const profit = sumYes - 1;
+    // Sell every leg by buying NO on each — guaranteed payout of (n-1) at resolution
+    const cost = group.reduce((s, m) => s + m.outcomePrices[1], 0);
+    if (cost <= 0) continue;
+    const roi = (profit / cost) * 100;
+    const earliestEnd = group.map(m => new Date(m.endDate)).sort((a, b) => a - b)[0];
+    const days = Math.max(1, Math.round((earliestEnd - new Date()) / 86400000));
+    const a = group[0], b = group[1];
+    opportunities.push({
+      id:        `logic_mutex_${a.eventId}_${Date.now()}`,
+      type:      "MUTEX",
+      market:    `${a.question.slice(0,40)}… vs ${b.question.slice(0,30)}…${group.length > 2 ? ` (+${group.length - 2})` : ""}`,
+      leg1:      { label: `NO  @ ${(a.outcomePrices[1]*100).toFixed(1)}¢`, market: a.question, price: a.outcomePrices[1], side: "NO" },
+      leg2:      { label: `NO  @ ${(b.outcomePrices[1]*100).toFixed(1)}¢`, market: b.question, price: b.outcomePrices[1], side: "NO" },
+      cost:      parseFloat(cost.toFixed(4)),
+      profit:    parseFloat(profit.toFixed(4)),
+      roi:       parseFloat(roi.toFixed(2)),
+      apy:       parseFloat((roi / days * 365).toFixed(1)),
+      expiry:    a.endDate,
+      daysToExpiry: days,
+      liquidity: `$${(group.reduce((s, m) => s + (m.liquidity || 0), 0) / 1000).toFixed(0)}K`,
+      riskLevel: "low",
+      category:  a.category,
+      rationale: `${group.length} markets in event group — YES prices sum to ${(sumYes*100).toFixed(1)}¢ > 100¢; at most one can resolve YES`,
+      scannedAt: nowTs(),
+      isLive,
+      url1:      a.slug ? `https://polymarket.com/market/${a.slug}` : null,
+      url2:      b.slug ? `https://polymarket.com/market/${b.slug}` : null,
+    });
   }
 
-  return opportunities.sort((a, b) => b.roi - a.roi).slice(0, 10);
+  return { opportunities: opportunities.sort((a, b) => b.roi - a.roi).slice(0, 10), status };
 }
 
 // Near-resolution scanner
 async function scanNearResolution() {
-  const polyMarkets = await polymarketAPI.getMarkets();
+  const { markets: polyMarkets, status } = await polymarketAPI.getMarkets();
+  const isLive = status === "live";
   const results = [];
 
   for (const m of polyMarkets) {
@@ -322,15 +329,22 @@ async function scanNearResolution() {
     const daysLeft = Math.max(1, Math.round((new Date(m.endDate) - new Date()) / 86400000));
     
     if (prob >= 0.88 && daysLeft <= 30 && daysLeft > 0) {
-      const effectivePrice = prob * 0.97; // assume 3% fee drag
-      const edge = prob - effectivePrice;
-      const roi = (1 / effectivePrice - 1) * 100;
+      // Near-resolution "harvest": buy YES near $1 and collect $1 at resolution.
+      // Polymarket has no taker fee on USDC; gas on Polygon is sub-cent, so the
+      // earlier `* 0.97` fee fudge is removed — `price` is just the market YES
+      // price. The ROI shown is the *conditional* yield-to-resolution `(1−p)/p`
+      // (return if YES wins), NOT expected ROI: at the market price, expected
+      // ROI is zero by construction. Anyone using this should treat it as a
+      // bond-style yield and apply their own probability adjustment for misses.
+      const price = prob;
+      const edge  = 0;
+      const roi   = price > 0 ? ((1 - price) / price) * 100 : 0;
       results.push({
         id: m.id,
         market: m.question.length > 70 ? m.question.slice(0, 67) + "…" : m.question,
         platform: "Polymarket",
         prob: parseFloat(prob.toFixed(3)),
-        price: parseFloat(effectivePrice.toFixed(3)),
+        price: parseFloat(price.toFixed(3)),
         edge: parseFloat(edge.toFixed(3)),
         roi: parseFloat(roi.toFixed(2)),
         daysToExpiry: daysLeft,
@@ -339,13 +353,13 @@ async function scanNearResolution() {
         category: m.category,
         apy: parseFloat((roi / daysLeft * 365).toFixed(1)),
         scannedAt: nowTs(),
-        isLive: apiStatus.poly === "live",
+        isLive,
         url1: m.slug ? `https://polymarket.com/market/${m.slug}` : null,
       });
     }
   }
 
-  return results.sort((a, b) => b.roi - a.roi).slice(0, 10);
+  return { opportunities: results.sort((a, b) => b.roi - a.roi).slice(0, 10), status };
 }
 
 // ─── Kelly Criterion Engine ───────────────────────────────────────────────────
@@ -357,7 +371,7 @@ function calcKelly(bankroll, prob, odds, fraction = 0.25) {
   const fracKelly = Math.max(0, fullKelly * fraction);
   const betSize = bankroll * fracKelly;
   const expectedValue = prob * (betSize * b) - q * betSize;
-  const expectedROI = (expectedValue / betSize) * 100;
+  const expectedROI = betSize > 0 ? (expectedValue / betSize) * 100 : 0;
   const rrr = (prob * odds) / 1; // reward-risk ratio
   return {
     fullKelly: Math.max(0, fullKelly),
@@ -382,73 +396,28 @@ function calcPortfolioKelly(positions, bankroll) {
   }));
 }
 
-// ─── WebSocket Simulator ──────────────────────────────────────────────────────
-// In production: replace with real WebSocket at wss://ws-subscriptions.polymarket.com
-function useWebSocketFeed(active) {
-  const [messages, setMessages] = useState([]);
-  const [prices, setPrices] = useState({});
-  const intervalRef = useRef(null);
-
-  const MARKETS_WS = [
-    { id: "poly_btc_80k", label: "BTC >$80K", base: 0.91 },
-    { id: "poly_fed_jun", label: "Fed Cut Jun", base: 0.31 },
-    { id: "poly_cpi", label: "CPI <3.5%", base: 0.95 },
-    { id: "poly_senate_r", label: "R Senate", base: 0.61 },
-    { id: "poly_nato", label: "NATO Summit", base: 0.96 },
-  ];
-
-  useEffect(() => {
-    if (!active) { clearInterval(intervalRef.current); return; }
-    // Initialize
-    const init = {};
-    MARKETS_WS.forEach(m => { init[m.id] = m.base; });
-    setPrices(init);
-
-    intervalRef.current = setInterval(() => {
-      const updates = {};
-      const newMsgs = [];
-      MARKETS_WS.forEach(m => {
-        const delta = (Math.random() - 0.49) * 0.012;
-        const newPrice = Math.max(0.01, Math.min(0.99, (prices[m.id] || m.base) + delta));
-        updates[m.id] = parseFloat(newPrice.toFixed(3));
-        if (Math.abs(delta) > 0.008) {
-          newMsgs.push({
-            id: Date.now() + m.id,
-            ts: nowTs(),
-            market: m.label,
-            price: newPrice,
-            delta: delta,
-            type: "PRICE_UPDATE",
-          });
-        }
-      });
-      setPrices(prev => ({ ...prev, ...updates }));
-      if (newMsgs.length > 0) {
-        setMessages(prev => [...newMsgs, ...prev].slice(0, 50));
-      }
-    }, 1200);
-
-    return () => clearInterval(intervalRef.current);
-  }, [active]);
-
-  return { messages, prices, MARKETS_WS };
-}
-
 // ─── Sections ─────────────────────────────────────────────────────────────────
 
 // API Feed Panel
-function APIFeedSection({ wsActive, onToggleWS }) {
-  const { messages, prices, MARKETS_WS } = useWebSocketFeed(wsActive);
+function APIFeedSection({ onScanComplete }) {
   const [scanLoading, setScanLoading] = useState(false);
   const [crossOpps, setCrossOpps] = useState([]);
   const [nearOpps, setNearOpps] = useState([]);
+  const [apiStat, setApiStat] = useState("unknown"); // "unknown" | "live" | "demo"
   const [apiLog, setApiLog] = useState([
     { ts: "09:41:22", method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: 200, ms: 187, source: "CLOB" },
     { ts: "09:41:23", method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: 200, ms: 310, source: "CLOB" },
     { ts: "09:41:23", method: "SCAN", endpoint: "logic-arb-engine: threshold + mutex", status: "OK", ms: 12, source: "SCANNER" },
   ]);
 
+  // Request-id guard: only the latest scan is allowed to write state.
+  // Prevents double-clicks and unmount-during-fetch from stomping results.
+  const reqIdRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
+
   const runScan = async () => {
+    const myId = ++reqIdRef.current;
     setScanLoading(true);
     const start = Date.now();
     setApiLog(prev => [
@@ -458,10 +427,16 @@ function APIFeedSection({ wsActive, onToggleWS }) {
     ]);
 
     try {
-      const [cross, near] = await Promise.all([scanLogicArb(), scanNearResolution()]);
+      const [crossRes, nearRes] = await Promise.all([scanLogicArb(), scanNearResolution()]);
+      if (!mountedRef.current || myId !== reqIdRef.current) return;
       const elapsed = Date.now() - start;
+      const status = crossRes.status || nearRes.status || "unknown";
+      const cross = crossRes.opportunities || [];
+      const near  = nearRes.opportunities  || [];
+      setApiStat(status);
       setCrossOpps(cross);
       setNearOpps(near);
+      onScanComplete?.({ cross: cross.length, near: near.length, status });
       setApiLog(prev => {
         const updated = [...prev];
         updated[0] = { ...updated[0], status: 200, ms: Math.round(elapsed * 0.55) };
@@ -472,12 +447,14 @@ function APIFeedSection({ wsActive, onToggleWS }) {
         ].slice(0, 20);
       });
     } catch(e) {
+      if (!mountedRef.current || myId !== reqIdRef.current) return;
       setApiLog(prev => [
         { ts: nowTs(), method: "ERR", endpoint: e.message, status: 500, ms: null, source: "SCANNER" },
         ...prev,
       ]);
+    } finally {
+      if (mountedRef.current && myId === reqIdRef.current) setScanLoading(false);
     }
-    setScanLoading(false);
   };
 
   const statusColor = { 200: C.green, "OK": C.green, "...": C.amber, 500: C.red };
@@ -490,10 +467,9 @@ function APIFeedSection({ wsActive, onToggleWS }) {
         <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14, textTransform: "uppercase" }}>API Integration Layer</div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
           {[
-            { label: "Polymarket CLOB", url: "clob.polymarket.com", status: apiStatus.poly === "live" ? "LIVE" : apiStatus.poly === "demo" ? "DEMO" : "—", color: apiStatus.poly === "live" ? C.green : apiStatus.poly === "demo" ? C.amber : C.muted },
-            { label: "Sampling Markets", url: "clob.polymarket.com/sampling-simplified-markets", status: apiStatus.poly === "live" ? "ACTIVE" : "STANDBY", color: apiStatus.poly === "live" ? C.cyan : C.muted },
+            { label: "Polymarket CLOB", url: "clob.polymarket.com", status: apiStat === "live" ? "LIVE" : apiStat === "demo" ? "DEMO" : "—", color: apiStat === "live" ? C.green : apiStat === "demo" ? C.amber : C.muted },
+            { label: "Sampling Markets", url: "clob.polymarket.com/sampling-simplified-markets", status: apiStat === "live" ? "ACTIVE" : "STANDBY", color: apiStat === "live" ? C.cyan : C.muted },
             { label: "Logic Arb Engine", url: "intra-platform inconsistencies", status: "ACTIVE", color: C.purple },
-            { label: "WebSocket Feed", url: "ws-subscriptions.polymarket.com", status: wsActive ? "CONNECTED" : "OFF", color: wsActive ? C.cyan : C.muted },
           ].map(api => (
             <div key={api.label} style={{ background: C.surface3, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", flex: "1 1 180px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
@@ -523,62 +499,8 @@ function APIFeedSection({ wsActive, onToggleWS }) {
           }}>
             {scanLoading ? <span>SCANNING <Blink color={C.blue} /></span> : "▸ RUN SCAN NOW"}
           </button>
-          <button onClick={onToggleWS} style={{
-            background: wsActive ? C.cyanDim : "none",
-            border: `1px solid ${wsActive ? C.cyan : C.border}66`,
-            color: wsActive ? C.cyan : C.muted,
-            padding: "8px 18px", borderRadius: 4, fontSize: 12, fontWeight: 700,
-            cursor: "pointer", fontFamily: "IBM Plex Mono, monospace", transition: "all 0.15s",
-          }}>
-            {wsActive ? "◼ STOP WS FEED" : "⇄ START WS FEED"}
-          </button>
         </div>
       </Card>
-
-      {/* WebSocket Live Feed */}
-      {wsActive && (
-        <Card style={{ padding: "16px 20px" }} accent={C.cyan}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <Dot active color={C.cyan} />
-              <span style={{ fontSize: 11, fontWeight: 700, color: C.cyan, letterSpacing: "0.8px" }}>WEBSOCKET LIVE FEED</span>
-              <Tag label="ws-subscriptions.polymarket.com" color={C.muted} size="xs" />
-            </div>
-          </div>
-          {/* Live price tickers */}
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
-            {MARKETS_WS.map(m => {
-              const p = prices[m.id] || m.base;
-              const delta = p - m.base;
-              return (
-                <div key={m.id} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 4, padding: "8px 12px", flex: "1 1 100px", minWidth: 100 }}>
-                  <div style={{ fontSize: 9, color: C.muted, marginBottom: 3 }}>{m.label}</div>
-                  <div style={{ fontSize: 16, fontFamily: "IBM Plex Mono, monospace", fontWeight: 700, color: C.text }}>{pct(p)}</div>
-                  <div style={{ fontSize: 10, color: delta >= 0 ? C.green : C.red, fontFamily: "IBM Plex Mono, monospace" }}>
-                    {delta >= 0 ? "▲" : "▼"} {Math.abs(delta * 100).toFixed(1)}pp
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          {/* Message stream */}
-          <div style={{ background: C.bg, borderRadius: 4, padding: "10px 12px", maxHeight: 140, overflowY: "auto", fontFamily: "IBM Plex Mono, monospace", fontSize: 11 }}>
-            {messages.length === 0 ? (
-              <span style={{ color: C.muted }}>Waiting for price movements... <Blink color={C.muted} /></span>
-            ) : messages.map(msg => (
-              <div key={msg.id} style={{ display: "flex", gap: 10, marginBottom: 3, alignItems: "center" }}>
-                <span style={{ color: C.dim }}>{msg.ts}</span>
-                <span style={{ color: C.muted }}>PRICE</span>
-                <span style={{ color: C.text }}>{msg.market}</span>
-                <span style={{ color: C.text, fontWeight: 700 }}>{pct(msg.price)}</span>
-                <span style={{ color: msg.delta >= 0 ? C.green : C.red }}>
-                  {msg.delta >= 0 ? "▲" : "▼"}{Math.abs(msg.delta * 100).toFixed(2)}pp
-                </span>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
 
       {/* Scan Results */}
       {(crossOpps.length > 0 || nearOpps.length > 0) && (
@@ -621,9 +543,9 @@ function APIFeedSection({ wsActive, onToggleWS }) {
                 {opp.url1 && <div style={{ marginTop: 4 }}><a href={opp.url1} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ View on Polymarket ↗</a></div>}
               </div>
               <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                <MetricMini label="Prob" value={pct(opp.prob)} color={C.cyan} />
                 <MetricMini label="Price" value={pct(opp.price)} color={C.amber} />
-                <MetricMini label="ROI" value={`+${opp.roi}%`} color={C.green} />
+                <MetricMini label="Yield (if YES)" value={`+${opp.roi}%`} color={C.green} />
+                <MetricMini label="Days" value={opp.daysToExpiry} color={C.muted} />
               </div>
             </div>
           ))}
@@ -655,11 +577,11 @@ function KellySection() {
   const [bankroll, setBankroll] = useState(5000);
   const [fraction, setFraction] = useState(0.25);
   const [positions, setPositions] = useState([
-    { id: 1, label: "Next Bond — Elordi (Cross-Plat)", prob: 0.97, odds: 1.235, type: "CROSS_PLAT" },
-    { id: 2, label: "BTC >$80K Apr 1 (Near-Res)", prob: 0.94, odds: 1.099, type: "NEAR_RES" },
-    { id: 3, label: "CPI <3.5% Mar (Near-Res)", prob: 0.97, odds: 1.053, type: "NEAR_RES" },
+    { id: 1, label: "BTC >$80K Apr 1 (Near-Res)", prob: 0.94, odds: 1.099, type: "NEAR_RES" },
+    { id: 2, label: "CPI <3.5% Mar (Near-Res)", prob: 0.97, odds: 1.053, type: "NEAR_RES" },
+    { id: 3, label: "Fed Cut Jun (Logic Arb)",   prob: 0.62, odds: 2.10,  type: "LOGIC_ARB" },
   ]);
-  const [newPos, setNewPos] = useState({ label: "", prob: "", odds: "", type: "CROSS_PLAT" });
+  const [newPos, setNewPos] = useState({ label: "", prob: "", odds: "", type: "LOGIC_ARB" });
   const [showAdd, setShowAdd] = useState(false);
 
   const kellyResults = useMemo(() => {
@@ -677,7 +599,7 @@ function KellySection() {
   const addPosition = () => {
     if (!newPos.label || !newPos.prob || !newPos.odds) return;
     setPositions(prev => [...prev, { id: Date.now(), ...newPos, prob: parseFloat(newPos.prob), odds: parseFloat(newPos.odds) }]);
-    setNewPos({ label: "", prob: "", odds: "", type: "CROSS_PLAT" });
+    setNewPos({ label: "", prob: "", odds: "", type: "LOGIC_ARB" });
     setShowAdd(false);
   };
 
@@ -798,9 +720,9 @@ function KellySection() {
             </div>
             <select value={newPos.type} onChange={e => setNewPos(p => ({ ...p, type: e.target.value }))}
               style={{ background: C.surface2, border: `1px solid ${C.border}`, color: C.text, padding: "7px 10px", borderRadius: 4, fontSize: 12, height: 35 }}>
-              <option value="CROSS_PLAT">Cross-Platform</option>
+              <option value="LOGIC_ARB">Logic Arb</option>
               <option value="NEAR_RES">Near-Resolution</option>
-              <option value="LOGIC">Logic Arb</option>
+              <option value="LOGIC">Other</option>
             </select>
             <button onClick={addPosition} style={{
               background: C.greenDim, border: `1px solid ${C.green}44`, color: C.green,
@@ -855,27 +777,26 @@ function KellySection() {
 const CLAUDE_MD_TEMPLATE = (config) => `# CLAUDE.md — Polymarket Arbitrage Bot
 
 ## Project Overview
-Automated prediction market arbitrage bot targeting cross-platform and logical arbitrage
-between Polymarket and Kalshi. Built and operated via Claude Code.
+Intra-Polymarket arbitrage scanner. Looks for two classes of price
+inconsistency on Polymarket alone: (1) threshold-monotonicity violations
+(e.g. P("BTC > $100k") > P("BTC > $80k")) and (2) mutual-exclusivity
+overcounts within an event group. Also surfaces near-resolution YES
+contracts as bond-style yields. Built and operated via Claude Code.
 
 ## Architecture
 \`\`\`
 ├── scanner/
-│   ├── cross_platform.py     # Polymarket vs Kalshi spread scanner
-│   ├── near_resolution.py    # Near-expiry harvest scanner
-│   ├── logic_arb.py          # Logical/combinatorial inconsistency detector
-│   └── ws_feed.py            # WebSocket price feed listener
+│   ├── near_resolution.py    # High-prob near-expiry harvest scanner
+│   ├── logic_arb.py          # Threshold + mutex inconsistency detector
+│   └── ws_feed.py            # Polymarket WebSocket price feed listener
 ├── execution/
 │   ├── poly_client.py        # py-clob-client wrapper
-│   ├── kalshi_client.py      # kalshi-python wrapper
 │   ├── order_manager.py      # FOK/IOC order placement
-│   └── position_tracker.py  # Open position + P&L tracking
+│   └── position_tracker.py   # Open position + P&L tracking
 ├── risk/
 │   ├── kelly.py              # Kelly criterion sizing engine
 │   ├── portfolio.py          # Portfolio-level exposure management
 │   └── safeguards.py         # Hard stop-loss, max drawdown, orphan detection
-├── intelligence/
-│   └── logic_engine.py       # Claude API calls for logical arb detection
 ├── monitoring/
 │   ├── telegram_alerts.py    # Trade alerts + P&L reports
 │   └── dashboard.py          # Local web dashboard
@@ -887,31 +808,33 @@ between Polymarket and Kalshi. Built and operated via Claude Code.
 - **Max single position:** ${config.maxSingleBet}% of bankroll
 - **Max total exposure:** ${config.maxTotalExposure}% of bankroll at any time
 - **Stop-loss:** Halt all trading if daily drawdown exceeds ${config.maxDrawdown}%
-- **No orphan legs:** Never place one leg of a cross-platform trade without the other
+- **No orphan legs:** Never place one leg of a multi-leg arb without the other
   - If leg 2 fails, immediately unwind leg 1
   - Use atomic execution with rollback logic
 - **Minimum edge:** Only trade if net spread > ${config.minEdge}% after estimated fees
 - **Liquidity gate:** Only trade markets with >${config.minLiquidity} liquidity
-- **Resolution verification:** For cross-platform: manually verify resolution criteria match before first trade on a new market pair
+- **Resolution verification:** Read each market's resolution criteria
+  before sizing into it for the first time
 
 ## Kelly Criterion Configuration
 - Fraction: ${config.kellyFraction} (¼ Kelly)
 - Max single bet: ${config.maxSingleBet}% of bankroll
 - Portfolio scaling: Yes (cap total at ${config.maxTotalExposure}%)
 - Recalculate sizing on each scan
+- Note: Kelly is for directional/value bets. True risk-free arbs (sum of
+  leg costs < $1) should be sized by liquidity, not Kelly.
 
 ## Strategy Priority
-1. **Near-Resolution Harvest** — lowest risk, execute immediately when found
-2. **Cross-Platform Arb** — verify resolution criteria first, then execute
-3. **Logical/Combinatorial** — use Claude API for analysis, require high confidence
+1. **Logic Arb (Threshold)** — guaranteed profit at resolution, execute first
+2. **Logic Arb (Mutex)** — guaranteed profit at resolution, requires event-group confirmation
+3. **Near-Resolution Yield** — bond-style yield, no real edge unless you have a probability view
 
 ## Loop Command
 Run this command in Claude Code to start the scanner loop:
 \`\`\`
 /loop every 5 minutes:
-  python scanner/cross_platform.py
-  python scanner/near_resolution.py
   python scanner/logic_arb.py
+  python scanner/near_resolution.py
   If opportunities found: python execution/order_manager.py --execute
   python monitoring/telegram_alerts.py --summary
 \`\`\`
@@ -922,23 +845,20 @@ POLYMARKET_PRIVATE_KEY=    # Polygon wallet private key
 POLYMARKET_API_KEY=        # From clob.polymarket.com
 POLYMARKET_API_SECRET=
 POLYMARKET_API_PASSPHRASE=
-KALSHI_EMAIL=
-KALSHI_PASSWORD=           # Or API key if using v2 key auth
-ANTHROPIC_API_KEY=         # For logic engine (Claude Sonnet)
 TELEGRAM_BOT_TOKEN=        # Optional: trade alerts
 TELEGRAM_CHAT_ID=
 \`\`\`
 
 ## Dependencies
 \`\`\`bash
-pip install py-clob-client kalshi-python anthropic python-telegram-bot websockets aiohttp pandas
+pip install py-clob-client python-telegram-bot websockets aiohttp pandas
 \`\`\`
 
 ## Multi-Agent Workflow (Claude Code)
 When building complex features, spawn subagents:
 - **Quant agent:** "Review kelly.py and verify the math is correct"
 - **Risk agent:** "Audit safeguards.py for any gaps in the orphan detection logic"
-- **API agent:** "Debug the Kalshi auth flow in kalshi_client.py"
+- **API agent:** "Debug the Polymarket CLOB auth flow in poly_client.py"
 
 ## Current Bankroll: $${config.bankroll.toLocaleString()}
 ## Current Kelly Fraction: ${config.kellyFraction}
@@ -1041,8 +961,8 @@ function ClaudeMdSection() {
         {[
           { n: "1", title: "Save CLAUDE.md", desc: "Copy the generated CLAUDE.md into your project root. Claude Code reads this automatically.", color: C.purple },
           { n: "2", title: "Scaffold project", desc: "Open Claude Code and say: \"Read CLAUDE.md and scaffold the full project structure, then install dependencies.\"", color: C.blue },
-          { n: "3", title: "Configure API keys", desc: "Add your Polymarket private key, Kalshi credentials, and Anthropic API key to .env", color: C.amber },
-          { n: "4", title: "Run in sandbox first", desc: "Use Kalshi demo env and Polymarket test mode. Verify scanner output before using real capital.", color: C.green },
+          { n: "3", title: "Configure API keys", desc: "Add your Polymarket private key (Polygon wallet) and CLOB API credentials to .env", color: C.amber },
+          { n: "4", title: "Run in dry-run first", desc: "Run the scanner read-only and verify opportunities by hand on polymarket.com before risking real capital.", color: C.green },
           { n: "5", title: "Start the loop", desc: `In Claude Code terminal: /loop — scans every ${config.scanInterval} minutes. Claude reviews opportunities and executes when criteria met.`, color: C.cyan },
         ].map(step => (
           <div key={step.n} style={{ display: "flex", gap: 14, marginBottom: 14, alignItems: "flex-start" }}>
@@ -1068,14 +988,14 @@ const TABS = [
 export default function ArbBotV2() {
   const [tab, setTab] = useState("api");
   const [botActive, setBotActive] = useState(false);
-  const [wsActive, setWsActive]   = useState(false);
+  // Counts of real scans completed and the most recent scan's market totals.
   const [scanCount, setScanCount] = useState(0);
+  const [lastScan, setLastScan] = useState({ cross: 0, near: 0, status: "unknown" });
 
-  useEffect(() => {
-    if (!botActive) return;
-    const t = setInterval(() => setScanCount(p => p + 1), 5000);
-    return () => clearInterval(t);
-  }, [botActive]);
+  const handleScanComplete = useCallback((info) => {
+    setScanCount(c => c + 1);
+    setLastScan(info);
+  }, []);
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'IBM Plex Sans', system-ui, sans-serif", fontSize: 14, lineHeight: 1.6 }}>
@@ -1095,8 +1015,8 @@ export default function ArbBotV2() {
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <div style={{ display: "flex", gap: 14, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 16px" }}>
               {[
-                ["Scans", (scanCount + 127).toString(), C.blue],
-                ["WS Feed", wsActive ? "LIVE" : "OFF", wsActive ? C.cyan : C.muted],
+                ["Scans", scanCount.toString(), C.blue],
+                ["API", lastScan.status === "live" ? "LIVE" : lastScan.status === "demo" ? "DEMO" : "—", lastScan.status === "live" ? C.green : lastScan.status === "demo" ? C.amber : C.muted],
                 ["Bot", botActive ? "ACTIVE" : "IDLE", botActive ? C.green : C.muted],
               ].map(([l, v, c]) => (
                 <div key={l} style={{ textAlign: "center" }}>
@@ -1139,7 +1059,7 @@ export default function ArbBotV2() {
       {botActive && (
         <div style={{ background: C.greenDim, borderBottom: `1px solid ${C.green}22`, padding: "5px 24px", fontFamily: "IBM Plex Mono, monospace", fontSize: 11, color: C.green, display: "flex", gap: 24, flexWrap: "wrap" }}>
           <span><Dot active color={C.green} size={6} /> BOT ACTIVE</span>
-          <span>MARKETS CHECKED: {(scanCount + 1) * 847}</span>
+          <span>LAST SCAN: {lastScan.cross} LOGIC ARB · {lastScan.near} NEAR-RES</span>
           <span>STRATEGIES: LOGIC ARB (THRESHOLD + MUTEX) · NEAR-RESOLUTION</span>
           <span style={{ color: C.amber }}>Kelly ¼ · Max exposure 50%</span>
         </div>
@@ -1147,13 +1067,13 @@ export default function ArbBotV2() {
 
       {/* Content */}
       <div style={{ padding: "24px", maxWidth: 980, margin: "0 auto" }}>
-        {tab === "api"    && <APIFeedSection wsActive={wsActive} onToggleWS={() => setWsActive(p => !p)} />}
+        {tab === "api"    && <APIFeedSection onScanComplete={handleScanComplete} />}
         {tab === "kelly"  && <KellySection />}
         {tab === "claude" && <ClaudeMdSection />}
       </div>
 
       <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 24px", fontSize: 10, color: C.muted, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-        <span>APIs: Polymarket Gamma · CLOB · WebSocket feed</span>
+        <span>API: Polymarket CLOB (clob.polymarket.com)</span>
         <span>Not financial advice. Capital at risk. Verify resolution criteria before trading.</span>
       </div>
     </div>

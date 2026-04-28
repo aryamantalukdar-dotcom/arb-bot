@@ -3,7 +3,7 @@
   "private": true,
   "version": "2.0.0",
   "type": "module",
-  "description": "Polymarket & Kalshi arbitrage scanner with Kelly Criterion position sizing",
+  "description": "Polymarket arbitrage scanner with Kelly Criterion position sizing",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
