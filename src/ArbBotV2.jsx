@@ -234,6 +234,9 @@ async function scanLogicArb() {
       const loYes = lo.outcomePrices[0];
       const hiYes = hi.outcomePrices[0];
 
+      if (lo.endDate !== hi.endDate) continue;
+      if (jaccard(lo.question, hi.question) < 0.55) continue;
+
       // Violation: hi-threshold market priced MORE likely than lo-threshold
       if (hiYes > loYes + 0.02) {
         // Trade: buy loYes YES + buy hiYes NO (combined < $1 guaranteed at resolution)
