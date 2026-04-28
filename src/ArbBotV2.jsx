@@ -143,12 +143,239 @@ async function fetchPolymarkets(limit = 60) {
       question:      d.question,
       endDate:       (d.end_date_iso || "")?.slice(0, 10),
       outcomePrices: [yesPrice, noPrice],
+      // token_ids are needed for /book (depth) and /prices-history (backtest).
+      // Stored alongside the prices so consumers don't have to re-zip.
+      yesTokenId:    String(yesToken.token_id || ""),
+      noTokenId:     String(noToken.token_id  || ""),
       volume:        parseFloat(d.volume    || 0),
       liquidity:     parseFloat(d.liquidity || 0),
       category:      d.tags?.[0] || "General",
       eventId,
     };
   }).filter(m => m && m.question && m.outcomePrices[0] > 0.001 && m.outcomePrices[0] < 0.999);
+}
+
+// ── Orderbook depth fetch + slippage walker ──────────────────────────────────
+// /book returns { bids: [{price, size}], asks: [{price, size}] } where
+// `price` is per-share USDC and `size` is the quantity of shares offered at
+// that price. Bids are sorted highest-first, asks lowest-first.
+async function fetchBook(tokenId) {
+  if (!tokenId) return null;
+  try {
+    const r = await fetch(`${CLOB_BASE}/book?token_id=${encodeURIComponent(tokenId)}`, { headers: { Accept: "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const norm = side => (Array.isArray(j[side]) ? j[side] : []).map(l => ({
+      price: parseFloat(l.price),
+      size:  parseFloat(l.size),
+    })).filter(l => Number.isFinite(l.price) && Number.isFinite(l.size) && l.size > 0);
+    return { bids: norm("bids"), asks: norm("asks") };
+  } catch {
+    return null;
+  }
+}
+
+// Walk the asks (or bids) until we've spent `budgetUsd` worth of USDC.
+// Returns { sharesFilled, avgPrice, spentUsd, exhausted } where `exhausted`
+// means the book ran out before the budget did. Use `asks` to simulate buying
+// YES (or buying NO via the No-token's asks).
+function walkAsks(asks, budgetUsd) {
+  let remainingUsd = budgetUsd;
+  let shares = 0;
+  let spent = 0;
+  for (const lvl of asks) {
+    if (remainingUsd <= 0) break;
+    const lvlNotional = lvl.price * lvl.size;
+    if (lvlNotional >= remainingUsd) {
+      const lvlShares = remainingUsd / lvl.price;
+      shares += lvlShares;
+      spent  += remainingUsd;
+      remainingUsd = 0;
+      break;
+    }
+    shares += lvl.size;
+    spent  += lvlNotional;
+    remainingUsd -= lvlNotional;
+  }
+  const exhausted = remainingUsd > 1e-6;
+  return {
+    sharesFilled: shares,
+    avgPrice:     shares > 0 ? spent / shares : null,
+    spentUsd:     spent,
+    exhausted,
+  };
+}
+
+// Cumulative cost-vs-shares curve for an ask side: out[k] = cost of buying
+// the first k shares walked across the book level-by-level.
+function buildCostCurve(asks) {
+  const out = [{ shares: 0, cost: 0, price: 0 }];
+  let s = 0, c = 0;
+  for (const lvl of asks) {
+    s += lvl.size;
+    c += lvl.size * lvl.price;
+    out.push({ shares: s, cost: c, price: lvl.price });
+  }
+  return out;
+}
+
+// Cost of buying `s` shares walking a precomputed cost curve. Returns Infinity
+// if `s` exceeds the book's total size (i.e., not fillable at any price).
+function costForShares(curve, s) {
+  if (s <= 0) return 0;
+  for (let i = 1; i < curve.length; i++) {
+    if (curve[i].shares >= s) {
+      const prev = curve[i - 1];
+      return prev.cost + (s - prev.shares) * curve[i].price;
+    }
+  }
+  return Infinity;
+}
+
+// Two-leg arbitrage: buy `S` shares of leg1 + `S` shares of leg2 such that one
+// always pays $1 at resolution. Find the largest S where total cost ≤ S (ROI
+// stays positive) and ≤ budget. Bisect on the cost curves.
+function simulateTwoLegFill(book1, book2, maxBudgetUsd = 5000) {
+  if (!book1?.asks?.length || !book2?.asks?.length) return null;
+  const c1 = buildCostCurve(book1.asks);
+  const c2 = buildCostCurve(book2.asks);
+  const maxS = Math.min(c1[c1.length - 1].shares, c2[c2.length - 1].shares);
+  if (maxS <= 0) return null;
+  let lo = 0, hi = maxS;
+  for (let iter = 0; iter < 60 && hi - lo > 1e-4; iter++) {
+    const mid = (lo + hi) / 2;
+    const cost = costForShares(c1, mid) + costForShares(c2, mid);
+    if (cost <= mid && cost <= maxBudgetUsd) lo = mid;
+    else hi = mid;
+  }
+  const shares = lo;
+  if (shares <= 0) return null;
+  const cost1 = costForShares(c1, shares);
+  const cost2 = costForShares(c2, shares);
+  const totalCost = cost1 + cost2;
+  const profit = shares - totalCost;
+  return {
+    shares,
+    cost1, cost2, totalCost,
+    avgPrice1: cost1 / shares,
+    avgPrice2: cost2 / shares,
+    profit,
+    roi: totalCost > 0 ? (profit / totalCost) * 100 : 0,
+  };
+}
+
+// ── Historical price fetch (backtester) ───────────────────────────────────────
+// Polymarket exposes /prices-history?market=<token_id>&interval=1m|1w|1d|6h|1h
+// — note `market` is the CLOB *token* id (not the condition_id). `fidelity` is
+// the granularity in minutes (default 200). Returns { history: [{t, p}, ...] }.
+async function fetchPricesHistory(tokenId, { interval = "1m", fidelity = 60 } = {}) {
+  if (!tokenId) return null;
+  try {
+    const url = `${CLOB_BASE}/prices-history?market=${encodeURIComponent(tokenId)}&interval=${interval}&fidelity=${fidelity}`;
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const arr = Array.isArray(j.history) ? j.history : [];
+    return arr.map(p => ({ t: Number(p.t), p: parseFloat(p.p) })).filter(p => Number.isFinite(p.t) && Number.isFinite(p.p));
+  } catch {
+    return null;
+  }
+}
+
+// Replay a two-leg arb over the historical price series of leg1 and leg2.
+// At each timestamp where both have a price within `toleranceSec`, compute
+// `cost = p1 + p2` (since each leg is buying YES on its respective token at
+// price p; for THRESH/MUTEX patterns the second leg is a NO bought at 1 - p).
+// Caller passes a `costFn(p1, p2)` to handle that mapping.
+function replayArb(history1, history2, costFn, toleranceSec = 7200) {
+  if (!history1?.length || !history2?.length) return null;
+  // Two-pointer merge: for each t in history1, find nearest t in history2.
+  let j = 0;
+  let samples = 0, hits = 0, totalEdge = 0, maxEdge = 0;
+  const trace = [];
+  for (const h1 of history1) {
+    while (j + 1 < history2.length && Math.abs(history2[j + 1].t - h1.t) <= Math.abs(history2[j].t - h1.t)) j++;
+    const h2 = history2[j];
+    if (!h2 || Math.abs(h2.t - h1.t) > toleranceSec) continue;
+    samples++;
+    const cost = costFn(h1.p, h2.p);
+    const edge = 1 - cost;
+    if (edge > 0.005) { // ignore <0.5¢ noise
+      hits++;
+      totalEdge += edge;
+      if (edge > maxEdge) maxEdge = edge;
+    }
+    trace.push({ t: h1.t, p1: h1.p, p2: h2.p, cost });
+  }
+  return {
+    samples,
+    hits,
+    avgEdge: hits > 0 ? totalEdge / hits : 0,
+    maxEdge,
+    hitRate: samples > 0 ? hits / samples : 0,
+    trace,
+  };
+}
+
+// ── Notifications ─────────────────────────────────────────────────────────────
+// Browser Notifications API (in-tab desktop alerts) + optional webhook POST
+// (Discord/Slack/Telegram-bot-friendly JSON). The webhook URL must come from
+// the user — never hardcoded — and is stored in localStorage under the key
+// `arbbot.notify`.
+async function requestNotificationPermission() {
+  if (typeof Notification === "undefined") return "unsupported";
+  if (Notification.permission === "granted" || Notification.permission === "denied") {
+    return Notification.permission;
+  }
+  try { return await Notification.requestPermission(); }
+  catch { return "denied"; }
+}
+
+function notifyDesktop(title, body) {
+  if (typeof Notification === "undefined") return;
+  if (Notification.permission !== "granted") return;
+  try { new Notification(title, { body }); } catch { /* swallow */ }
+}
+
+async function notifyWebhook(url, payload) {
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch { /* swallow — best-effort */ }
+}
+
+// Fan out notifications for every opportunity over `minRoi`. Caller decides
+// whether to use desktop, webhook, or both.
+async function fanOutNotifications({ desktop, webhookUrl, minRoi, opportunities }) {
+  const winners = (opportunities || []).filter(o => (o.depthOk !== false ? (o.depthRoi ?? o.roi) : 0) >= minRoi);
+  if (winners.length === 0) return 0;
+  for (const o of winners) {
+    const headline = `${o.type} ${o.depthRoi != null ? o.depthRoi : o.roi}% — ${o.market}`;
+    const body = `Cost ${money(o.cost)} · Profit ${money(o.profit)} · ${o.daysToExpiry}d to expiry`;
+    if (desktop) notifyDesktop(headline, body);
+  }
+  if (webhookUrl) {
+    await notifyWebhook(webhookUrl, {
+      content: `Arb bot: ${winners.length} opportunit${winners.length === 1 ? "y" : "ies"} ≥ ${minRoi}% ROI`,
+      opportunities: winners.map(o => ({
+        type: o.type,
+        market: o.market,
+        topRoi: o.roi,
+        depthRoi: o.depthRoi ?? null,
+        depthShares: o.depthShares ?? null,
+        cost: o.cost,
+        profit: o.profit,
+        daysToExpiry: o.daysToExpiry,
+        url1: o.url1,
+        url2: o.url2,
+      })),
+    });
+  }
+  return winners.length;
 }
 
 // ── Polymarket API client with 30s cache + fallback ───────────────────────────
@@ -193,6 +420,32 @@ const polymarketAPI = {
 //  Pattern C — Conditional dominance:
 //    If event A logically implies event B, then P(A) ≤ P(B) must hold.
 //    e.g. "Republicans win 60+ Senate seats" implies "Republicans control Senate"
+
+// Curated implication rules for the dominance scanner. Each rule pairs a
+// "stronger" event (logically implies the weaker) with a "weaker" event. If
+// stronger is priced higher than weaker, that's an arbitrage. Edit this list
+// as you find new pairs — patterns are case-insensitive regexes against the
+// market question text. Keep rules narrow to avoid false positives.
+const DOMINANCE_RULES = [
+  {
+    id: "btc_above_higher_implies_lower",
+    description: "BTC > X implies BTC > Y for X > Y",
+    stronger: /bitcoin\s+exceed\s+\$?100[,\s]?000/i,
+    weaker:   /bitcoin\s+exceed\s+\$?80[,\s]?000/i,
+  },
+  {
+    id: "eth_above_higher_implies_lower",
+    description: "ETH > X implies ETH > Y for X > Y",
+    stronger: /ethereum\s+exceed\s+\$?4[,\s]?000/i,
+    weaker:   /ethereum\s+exceed\s+\$?3[,\s]?000/i,
+  },
+  {
+    id: "cpi_below_lower_implies_higher",
+    description: "CPI < X implies CPI < Y for X < Y",
+    stronger: /cpi\s+below\s+3(?!\.5)/i,
+    weaker:   /cpi\s+below\s+3\.5/i,
+  },
+];
 
 // Extract numeric threshold from question text ("$80,000" → 80000, "3.5%" → 3.5)
 function extractThreshold(text) {
@@ -248,8 +501,8 @@ async function scanLogicArb() {
             id:        `logic_thresh_${lo.id}_${hi.id}_${Date.now()}`,
             type:      "THRESH",
             market:    lo.question.length > 55 ? lo.question.slice(0, 52) + "…" : lo.question,
-            leg1:      { label: `YES  @ ${(loYes*100).toFixed(1)}¢`, market: lo.question,  price: loYes,               side: "YES" },
-            leg2:      { label: `NO   @ ${(hi.outcomePrices[1]*100).toFixed(1)}¢`, market: hi.question, price: hi.outcomePrices[1], side: "NO"  },
+            leg1:      { label: `YES  @ ${(loYes*100).toFixed(1)}¢`, market: lo.question,  price: loYes,               side: "YES", tokenId: lo.yesTokenId },
+            leg2:      { label: `NO   @ ${(hi.outcomePrices[1]*100).toFixed(1)}¢`, market: hi.question, price: hi.outcomePrices[1], side: "NO",  tokenId: hi.noTokenId  },
             cost:      parseFloat(cost.toFixed(4)),
             profit:    parseFloat(profit.toFixed(4)),
             roi:       parseFloat(roi.toFixed(2)),
@@ -264,6 +517,7 @@ async function scanLogicArb() {
             isLive,
             url1:      lo.slug ? `https://polymarket.com/market/${lo.slug}` : null,
             url2:      hi.slug ? `https://polymarket.com/market/${hi.slug}` : null,
+            multiLeg:  false,
           });
         }
       }
@@ -296,8 +550,8 @@ async function scanLogicArb() {
       id:        `logic_mutex_${a.eventId}_${Date.now()}`,
       type:      "MUTEX",
       market:    `${a.question.slice(0,40)}… vs ${b.question.slice(0,30)}…${group.length > 2 ? ` (+${group.length - 2})` : ""}`,
-      leg1:      { label: `NO  @ ${(a.outcomePrices[1]*100).toFixed(1)}¢`, market: a.question, price: a.outcomePrices[1], side: "NO" },
-      leg2:      { label: `NO  @ ${(b.outcomePrices[1]*100).toFixed(1)}¢`, market: b.question, price: b.outcomePrices[1], side: "NO" },
+      leg1:      { label: `NO  @ ${(a.outcomePrices[1]*100).toFixed(1)}¢`, market: a.question, price: a.outcomePrices[1], side: "NO", tokenId: a.noTokenId },
+      leg2:      { label: `NO  @ ${(b.outcomePrices[1]*100).toFixed(1)}¢`, market: b.question, price: b.outcomePrices[1], side: "NO", tokenId: b.noTokenId },
       cost:      parseFloat(cost.toFixed(4)),
       profit:    parseFloat(profit.toFixed(4)),
       roi:       parseFloat(roi.toFixed(2)),
@@ -312,10 +566,99 @@ async function scanLogicArb() {
       isLive,
       url1:      a.slug ? `https://polymarket.com/market/${a.slug}` : null,
       url2:      b.slug ? `https://polymarket.com/market/${b.slug}` : null,
+      multiLeg:  group.length > 2,
     });
   }
 
-  return { opportunities: opportunities.sort((a, b) => b.roi - a.roi).slice(0, 10), status };
+  // ── Pattern C: conditional dominance ────────────────────────────────────────
+  // If event A logically implies event B then P(A) ≤ P(B) must hold. When the
+  // market violates that ("BTC > $100k" priced higher than "BTC > $80k") buy
+  // YES on B + NO on A for a guaranteed profit at resolution. The threshold
+  // pattern catches one common case; this pattern uses a curated rules table
+  // to catch implication relationships that aren't pure monotonicity over a
+  // numeric threshold (e.g. "Republicans win 60+ Senate seats" implies
+  // "Republicans control Senate"). Add rules over time as you find them.
+  for (const rule of DOMINANCE_RULES) {
+    const stronger = markets.find(m => rule.stronger.test(m.question));
+    const weaker   = markets.find(m => rule.weaker.test(m.question));
+    if (!stronger || !weaker) continue;
+    if (stronger.eventId && weaker.eventId && stronger.eventId !== weaker.eventId) {
+      // Skip cross-event rules unless explicitly intended; resolution criteria
+      // can drift between events.
+      if (!rule.allowCrossEvent) continue;
+    }
+    const sYes = stronger.outcomePrices[0];
+    const wYes = weaker.outcomePrices[0];
+    // Violation when stronger is priced more likely than weaker by > 2¢
+    if (sYes <= wYes + 0.02) continue;
+    const cost = sYes + (1 - wYes); // buy NO on stronger + YES on weaker — wait, let's think
+    // Trade: buy YES on weaker (cheaper than its true prob) + buy NO on stronger
+    // (expensive given P(stronger) < P(weaker) constraint) → at resolution one
+    // pays $1, other pays $0 (no, this isn't a perfect arb because the events
+    // aren't mutex; rather, when stronger=YES, weaker must also be YES, so YES
+    // on weaker pays. When stronger=NO and weaker=YES, NO-on-stronger pays AND
+    // YES-on-weaker pays. When both NO, NO-on-stronger pays. So payoff is at
+    // least $1 always — in fact $2 when stronger=NO+weaker=YES).
+    // Worst-case payout = $1, cost = wYes + (1 - sYes). Arb iff cost < 1.
+    const realCost = wYes + (1 - sYes);
+    const profit   = 1 - realCost;
+    if (profit <= 0.01) continue;
+    const roi      = (profit / realCost) * 100;
+    const days     = Math.max(1, Math.round((new Date(weaker.endDate) - new Date()) / 86400000));
+    opportunities.push({
+      id:        `logic_dom_${rule.id}_${Date.now()}`,
+      type:      "DOMINANCE",
+      market:    `${stronger.question.slice(0, 35)}… implies ${weaker.question.slice(0, 30)}…`,
+      leg1:      { label: `YES @ ${(wYes*100).toFixed(1)}¢`,       market: weaker.question,   price: wYes,       side: "YES", tokenId: weaker.yesTokenId },
+      leg2:      { label: `NO  @ ${((1-sYes)*100).toFixed(1)}¢`,    market: stronger.question, price: 1 - sYes,    side: "NO",  tokenId: stronger.noTokenId },
+      cost:      parseFloat(realCost.toFixed(4)),
+      profit:    parseFloat(profit.toFixed(4)),
+      roi:       parseFloat(roi.toFixed(2)),
+      apy:       parseFloat((roi / days * 365).toFixed(1)),
+      expiry:    weaker.endDate,
+      daysToExpiry: days,
+      liquidity: `$${((stronger.liquidity + weaker.liquidity) / 1000).toFixed(0)}K`,
+      riskLevel: "low",
+      category:  weaker.category,
+      rationale: `${rule.description}. Stronger event priced at ${(sYes*100).toFixed(1)}¢ > weaker at ${(wYes*100).toFixed(1)}¢ — implies impossible.`,
+      scannedAt: nowTs(),
+      isLive,
+      url1:      weaker.slug   ? `https://polymarket.com/market/${weaker.slug}`   : null,
+      url2:      stronger.slug ? `https://polymarket.com/market/${stronger.slug}` : null,
+      multiLeg:  false,
+    });
+  }
+
+  // ── Depth pass: enrich each opp with slippage-aware metrics ────────────────
+  // Walks the L2 orderbooks for both legs and finds the largest size where
+  // the marginal pair-cost stays < $1. The static top-of-book ROI in `roi` is
+  // optimistic; `depthRoi` is what you'd actually realize at `depthShares`.
+  // Multi-leg mutex (n > 2) is depth-checked only on the first two legs,
+  // flagged via `multiLeg`.
+  const top = opportunities.sort((a, b) => b.roi - a.roi).slice(0, 10);
+  const depths = await Promise.all(top.map(async opp => {
+    if (!opp.leg1?.tokenId || !opp.leg2?.tokenId) return null;
+    const [book1, book2] = await Promise.all([
+      fetchBook(opp.leg1.tokenId),
+      fetchBook(opp.leg2.tokenId),
+    ]);
+    return simulateTwoLegFill(book1, book2, 5000);
+  }));
+  for (let k = 0; k < top.length; k++) {
+    const sim = depths[k];
+    if (!sim || sim.shares <= 0) {
+      top[k].depthOk = false;
+      top[k].depthNote = "no fillable depth at top-of-book prices";
+      continue;
+    }
+    top[k].depthShares = parseFloat(sim.shares.toFixed(2));
+    top[k].depthCost   = parseFloat(sim.totalCost.toFixed(2));
+    top[k].depthProfit = parseFloat(sim.profit.toFixed(2));
+    top[k].depthRoi    = parseFloat(sim.roi.toFixed(2));
+    top[k].depthOk     = sim.profit > 0.5; // arbitrary $0.50 floor of realizable profit
+  }
+
+  return { opportunities: top, status };
 }
 
 // Near-resolution scanner
@@ -399,7 +742,7 @@ function calcPortfolioKelly(positions, bankroll) {
 // ─── Sections ─────────────────────────────────────────────────────────────────
 
 // API Feed Panel
-function APIFeedSection({ onScanComplete }) {
+function APIFeedSection({ onScanComplete, onPaperTrade }) {
   const [scanLoading, setScanLoading] = useState(false);
   const [crossOpps, setCrossOpps] = useState([]);
   const [nearOpps, setNearOpps] = useState([]);
@@ -410,11 +753,64 @@ function APIFeedSection({ onScanComplete }) {
     { ts: "09:41:23", method: "SCAN", endpoint: "logic-arb-engine: threshold + mutex", status: "OK", ms: 12, source: "SCANNER" },
   ]);
 
+  // Notification settings persisted in localStorage. The webhook URL is
+  // optional and used for Discord/Slack/Telegram-bot-style POSTs.
+  const [notif, setNotif] = useState(() => {
+    try {
+      const raw = localStorage.getItem("arbbot.notify");
+      if (raw) return JSON.parse(raw);
+    } catch { /* ignore */ }
+    return { desktop: false, webhookUrl: "", minRoi: 2.0 };
+  });
+  useEffect(() => {
+    try { localStorage.setItem("arbbot.notify", JSON.stringify(notif)); } catch { /* ignore */ }
+  }, [notif]);
+  const [notifPerm, setNotifPerm] = useState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
+
+  // Per-opp "Execute (Paper)" busy/feedback state, keyed by opportunity id.
+  const [paperBusy, setPaperBusy] = useState(null);
+  const [paperMsg, setPaperMsg]   = useState(null); // { id, type: "ok" | "err", text }
+  const [paperBudget, setPaperBudget] = useState(500); // USDC per paper trade
+
   // Request-id guard: only the latest scan is allowed to write state.
   // Prevents double-clicks and unmount-during-fetch from stomping results.
   const reqIdRef = useRef(0);
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
+
+  const executePaper = async (opp) => {
+    if (!onPaperTrade) return;
+    setPaperBusy(opp.id);
+    setPaperMsg(null);
+    try {
+      const fill = await snapTwoLegFill(opp, Number(paperBudget) || 500);
+      if (!fill.ok) {
+        setPaperMsg({ id: opp.id, type: "err", text: `Could not fill: ${fill.reason}` });
+        return;
+      }
+      const entry = {
+        id:     `paper_${opp.id}_${Date.now()}`,
+        ts:     Date.now(),
+        budgetUsd: Number(paperBudget) || 500,
+        opp: {
+          id:     opp.id,
+          type:   opp.type,
+          market: opp.market,
+          leg1:   opp.leg1,
+          leg2:   opp.leg2,
+          expiry: opp.expiry,
+        },
+        fill,
+        status: "open",
+      };
+      onPaperTrade(entry);
+      setPaperMsg({ id: opp.id, type: "ok", text: `Recorded ${fmt(fill.shares, 1)} shares · cost ${money(fill.totalCost, 2)}` });
+    } catch (e) {
+      setPaperMsg({ id: opp.id, type: "err", text: String(e?.message || e) });
+    } finally {
+      setPaperBusy(null);
+    }
+  };
 
   const runScan = async () => {
     const myId = ++reqIdRef.current;
@@ -436,7 +832,17 @@ function APIFeedSection({ onScanComplete }) {
       setApiStat(status);
       setCrossOpps(cross);
       setNearOpps(near);
-      onScanComplete?.({ cross: cross.length, near: near.length, status });
+      onScanComplete?.({ cross: cross.length, near: near.length, status, opportunities: cross });
+      // Fan-out notifications for opps clearing the user's ROI threshold. Best
+      // effort: failures here don't break the scan.
+      if (notif.desktop || notif.webhookUrl) {
+        fanOutNotifications({
+          desktop: notif.desktop,
+          webhookUrl: notif.webhookUrl,
+          minRoi: Number(notif.minRoi) || 0,
+          opportunities: cross,
+        });
+      }
       setApiLog(prev => {
         const updated = [...prev];
         updated[0] = { ...updated[0], status: 200, ms: Math.round(elapsed * 0.55) };
@@ -490,7 +896,7 @@ function APIFeedSection({ onScanComplete }) {
           <div style={{ marginTop: 4 }}><span style={{ color: C.dim }}>// Scans {"{"}limit{"}"} active markets for threshold &amp; mutex violations</span></div>
         </div>
 
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <button onClick={runScan} disabled={scanLoading} style={{
             background: scanLoading ? "none" : C.blueDim, border: `1px solid ${scanLoading ? C.border : C.blue}66`,
             color: scanLoading ? C.muted : C.blue, padding: "8px 18px", borderRadius: 4,
@@ -499,6 +905,60 @@ function APIFeedSection({ onScanComplete }) {
           }}>
             {scanLoading ? <span>SCANNING <Blink color={C.blue} /></span> : "▸ RUN SCAN NOW"}
           </button>
+          <span style={{ fontSize: 10, color: C.muted, fontFamily: "IBM Plex Mono, monospace", marginLeft: 8 }}>PAPER BUDGET</span>
+          <input type="number" min="50" max="50000" step="50" value={paperBudget}
+            onChange={e => setPaperBudget(parseFloat(e.target.value) || 0)}
+            title="USDC notional used by Execute (Paper) per click"
+            style={{ width: 100, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.amber, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace" }} />
+        </div>
+      </Card>
+
+      {/* Notifications */}
+      <Card style={{ padding: "16px 20px" }}>
+        <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14, textTransform: "uppercase" }}>Notifications</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>BROWSER ALERTS</div>
+            <button onClick={async () => {
+              const p = await requestNotificationPermission();
+              setNotifPerm(p);
+              if (p === "granted") setNotif(n => ({ ...n, desktop: true }));
+            }} style={{
+              background: notifPerm === "granted" && notif.desktop ? C.greenDim : C.surface3,
+              border: `1px solid ${notifPerm === "granted" && notif.desktop ? C.green : C.border}66`,
+              color: notifPerm === "granted" && notif.desktop ? C.green : C.muted,
+              padding: "7px 12px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
+              fontFamily: "IBM Plex Mono, monospace", height: 35,
+            }}>{
+              notifPerm === "unsupported" ? "UNSUPPORTED" :
+              notifPerm === "denied"      ? "BLOCKED"     :
+              notif.desktop && notifPerm === "granted" ? "✓ ON" :
+              "ENABLE"
+            }</button>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>MIN ROI %</div>
+            <input type="number" step="0.5" min="0" max="100" value={notif.minRoi}
+              onChange={e => setNotif(n => ({ ...n, minRoi: parseFloat(e.target.value) || 0 }))}
+              style={{ width: 80, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.green, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace", boxSizing: "border-box", height: 35 }} />
+          </div>
+          <div style={{ flex: "1 1 240px" }}>
+            <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>WEBHOOK URL (optional — Discord/Slack/Telegram bot)</div>
+            <input type="url" value={notif.webhookUrl} placeholder="https://discord.com/api/webhooks/…"
+              onChange={e => setNotif(n => ({ ...n, webhookUrl: e.target.value }))}
+              style={{ width: "100%", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace", boxSizing: "border-box", height: 35 }} />
+          </div>
+          <button onClick={async () => {
+            notifyDesktop("Arb bot test", "If you can see this, browser notifications are wired up.");
+            if (notif.webhookUrl) await notifyWebhook(notif.webhookUrl, { content: "Arb bot test ping — webhook OK" });
+          }} style={{
+            background: C.surface3, border: `1px solid ${C.border}`, color: C.muted,
+            padding: "7px 14px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
+            fontFamily: "IBM Plex Mono, monospace", height: 35,
+          }}>TEST</button>
+        </div>
+        <div style={{ marginTop: 10, fontSize: 10, color: C.dim, fontStyle: "italic" }}>
+          Fires on every successful scan. Only opportunities with depth-checked ROI ≥ Min ROI are sent.
         </div>
       </Card>
 
@@ -513,22 +973,45 @@ function APIFeedSection({ onScanComplete }) {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ marginBottom: 4 }}>
-                    <Tag label={opp.type === "THRESH" ? "THRESHOLD" : "MUTEX"} color={opp.type === "THRESH" ? C.blue : C.purple} size="xs" />
+                    <Tag label={opp.type === "THRESH" ? "THRESHOLD" : opp.type === "DOMINANCE" ? "DOMINANCE" : "MUTEX"} color={opp.type === "THRESH" ? C.blue : opp.type === "DOMINANCE" ? C.cyan : C.purple} size="xs" />
                     {opp.isLive && <Tag label="LIVE" color={C.green} size="xs" style={{ marginLeft: 4 }} />}
+                    {opp.depthOk === false && <Tag label="THIN BOOK" color={C.red} size="xs" style={{ marginLeft: 4 }} />}
+                    {opp.multiLeg && <Tag label="MULTI-LEG" color={C.amber} size="xs" style={{ marginLeft: 4 }} />}
                     <span style={{ color: C.text, fontSize: 12, marginLeft: 8, fontWeight: 600 }}>{opp.market}</span>
                   </div>
                   <div style={{ fontSize: 10, color: C.muted, fontFamily: "IBM Plex Mono, monospace", marginTop: 2 }}>
                     Leg 1: {opp.leg1?.label} · Leg 2: {opp.leg2?.label}
                   </div>
                   {opp.rationale && <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>{opp.rationale}</div>}
-                  <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
+                  {opp.depthShares != null && (
+                    <div style={{ fontSize: 10, color: opp.depthOk ? C.cyan : C.red, fontFamily: "IBM Plex Mono, monospace", marginTop: 2 }}>
+                      Depth: max {opp.depthShares} pairs · realized cost ${opp.depthCost} · profit ${opp.depthProfit} · ROI {opp.depthRoi}%
+                    </div>
+                  )}
+                  {opp.depthNote && (
+                    <div style={{ fontSize: 10, color: C.red, fontFamily: "IBM Plex Mono, monospace", marginTop: 2 }}>
+                      Depth: {opp.depthNote}
+                    </div>
+                  )}
+                  <div style={{ marginTop: 6, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                     {opp.url1 && <a href={opp.url1} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 1 on Polymarket ↗</a>}
                     {opp.url2 && <a href={opp.url2} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 2 on Polymarket ↗</a>}
+                    <button onClick={() => executePaper(opp)} disabled={paperBusy === opp.id || !opp.leg1?.tokenId || !opp.leg2?.tokenId} style={{
+                      background: C.amberDim, border: `1px solid ${C.amber}66`, color: C.amber,
+                      padding: "3px 10px", borderRadius: 3, fontSize: 10, fontWeight: 700,
+                      cursor: (paperBusy === opp.id || !opp.leg1?.tokenId) ? "default" : "pointer",
+                      fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.3px",
+                    }}>{paperBusy === opp.id ? "FILLING…" : "✎ EXECUTE (PAPER)"}</button>
+                    {paperMsg && paperMsg.id === opp.id && (
+                      <span style={{ fontSize: 10, color: paperMsg.type === "ok" ? C.green : C.red, fontFamily: "IBM Plex Mono, monospace" }}>
+                        {paperMsg.type === "ok" ? "✓ " : "✗ "}{paperMsg.text}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                  <MetricMini label="Cost" value={money(opp.cost)} color={C.amber} />
-                  <MetricMini label="ROI" value={`+${opp.roi}%`} color={C.green} />
+                  <MetricMini label="Top-Cost" value={money(opp.cost)} color={C.amber} />
+                  <MetricMini label="Top-ROI" value={`+${opp.roi}%`} color={C.green} />
                   <MetricMini label="APY" value={`${opp.apy}%`} color={C.purple} />
                   <MetricMini label="Days" value={opp.daysToExpiry} color={C.muted} />
                 </div>
@@ -978,11 +1461,309 @@ function ClaudeMdSection() {
   );
 }
 
+// ─── Paper-Trade Journal (Phase 2) ────────────────────────────────────────────
+// Records hypothetical fills and tracks them over time. Persisted in
+// localStorage under `arbbot.paper`. Each entry: { id, ts, opp, fill, status }.
+// Status is "open" until manually closed. Closing snaps the current orderbook
+// and computes realized P&L vs the recorded entry cost. Capital is fictional —
+// no funds move, no orders are placed on Polymarket. This is the validation
+// step before any real-money execution gets wired in Phase 3.
+const PAPER_KEY = "arbbot.paper";
+
+function loadPaperJournal() {
+  try { return JSON.parse(localStorage.getItem(PAPER_KEY) || "[]"); }
+  catch { return []; }
+}
+function savePaperJournal(entries) {
+  try { localStorage.setItem(PAPER_KEY, JSON.stringify(entries)); } catch { /* ignore */ }
+}
+
+// Snap the live orderbook for both legs and compute the realized fill at
+// `budgetUsd`. Used both for "open paper trade" and "close paper trade".
+async function snapTwoLegFill(opp, budgetUsd) {
+  if (!opp?.leg1?.tokenId || !opp?.leg2?.tokenId) {
+    return { ok: false, reason: "missing token IDs" };
+  }
+  const [b1, b2] = await Promise.all([fetchBook(opp.leg1.tokenId), fetchBook(opp.leg2.tokenId)]);
+  const sim = simulateTwoLegFill(b1, b2, budgetUsd);
+  if (!sim || sim.shares <= 0) return { ok: false, reason: "no fillable depth" };
+  return {
+    ok: true,
+    shares:    sim.shares,
+    cost1:     sim.cost1,
+    cost2:     sim.cost2,
+    totalCost: sim.totalCost,
+    avgPrice1: sim.avgPrice1,
+    avgPrice2: sim.avgPrice2,
+    profit:    sim.profit,
+    roi:       sim.roi,
+    snapTs:    Date.now(),
+  };
+}
+
+function PaperTradeSection({ journal, setJournal }) {
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError]   = useState("");
+
+  const closeTrade = async (entry) => {
+    setBusyId(entry.id);
+    setError("");
+    try {
+      // Re-snap the orderbooks now to estimate "what could I sell into right
+      // now?" — actually for a closing paper trade what we want is "if I sat
+      // out till resolution, what's the payout?" or "if I close now at the
+      // current bid, what do I realize?" For a paper journal v1 the simplest
+      // honest thing is: use the current YES price of each leg as mark.
+      const [b1, b2] = await Promise.all([fetchBook(entry.opp.leg1.tokenId), fetchBook(entry.opp.leg2.tokenId)]);
+      const bestBid1 = b1?.bids?.[0]?.price ?? null;
+      const bestBid2 = b2?.bids?.[0]?.price ?? null;
+      const bestAsk1 = b1?.asks?.[0]?.price ?? null;
+      const bestAsk2 = b2?.asks?.[0]?.price ?? null;
+      // Close at the current best-bid on each leg if both books have bids.
+      // Otherwise assume hold-to-expiry: in a true two-leg arb exactly one leg
+      // pays $1 and the other $0, so the per-pair payout is $1.
+      const haveBoth = bestBid1 != null && bestBid2 != null;
+      const realizedAt = haveBoth
+        ? entry.fill.shares * (bestBid1 + bestBid2)
+        : entry.fill.shares;
+      const closeNote = haveBoth
+        ? `Closed at best-bid: ${(bestBid1 * 100).toFixed(1)}¢ / ${(bestBid2 * 100).toFixed(1)}¢`
+        : "Closed at expiry assumption ($1 per pair)";
+      const realizedPnl = realizedAt - entry.fill.totalCost;
+      setJournal(j => j.map(e => e.id === entry.id ? {
+        ...e,
+        status: "closed",
+        closedTs: Date.now(),
+        closedAt: { bestBid1, bestBid2, bestAsk1, bestAsk2 },
+        realizedAt: parseFloat(realizedAt.toFixed(2)),
+        realizedPnl: parseFloat(realizedPnl.toFixed(2)),
+        closeNote,
+      } : e));
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const removeTrade = (id) => setJournal(j => j.filter(e => e.id !== id));
+  const clearAll = () => setJournal([]);
+
+  const totalOpen   = journal.filter(e => e.status === "open").reduce((s, e) => s + e.fill.totalCost, 0);
+  const totalClosed = journal.filter(e => e.status === "closed").reduce((s, e) => s + (e.realizedPnl || 0), 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <Card style={{ padding: "16px 20px" }} accent={C.amber}>
+        <div style={{ fontSize: 11, color: C.amber, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 8 }}>✎ PAPER TRADING</div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.7 }}>
+          No funds move. Each "Execute (Paper)" button on the Scanner tab snaps the live Polymarket orderbooks, computes the realistic fill at a chosen size, and records the entry here. Close trades manually to mark them against current best-bids. Use this for a few days/weeks before turning on real execution in Phase 3.
+        </div>
+      </Card>
+
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        {[
+          ["Open notional", money(totalOpen, 0), C.amber],
+          ["Closed P&L",    `${totalClosed >= 0 ? "+" : ""}${money(totalClosed, 2)}`, totalClosed >= 0 ? C.green : C.red],
+          ["Open trades",   journal.filter(e => e.status === "open").length.toString(), C.cyan],
+          ["Closed trades", journal.filter(e => e.status === "closed").length.toString(), C.muted],
+        ].map(([l, v, c]) => (
+          <Card key={l} style={{ padding: "14px 18px", flex: "1 1 140px" }}>
+            <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.7px", marginBottom: 4 }}>{l}</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: c, fontFamily: "IBM Plex Mono, monospace" }}>{v}</div>
+          </Card>
+        ))}
+      </div>
+
+      <Card style={{ padding: "16px 20px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.8px" }}>JOURNAL</div>
+          {journal.length > 0 && (
+            <button onClick={clearAll} style={{
+              background: C.redDim, border: `1px solid ${C.red}44`, color: C.red,
+              padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
+            }}>CLEAR ALL</button>
+          )}
+        </div>
+        {error && (
+          <div style={{ marginBottom: 10, padding: "8px 12px", background: C.redDim, border: `1px solid ${C.red}44`, borderRadius: 4, fontSize: 11, color: C.red, fontFamily: "IBM Plex Mono, monospace" }}>
+            {error}
+          </div>
+        )}
+        {journal.length === 0 ? (
+          <div style={{ fontSize: 12, color: C.muted, fontStyle: "italic" }}>
+            No paper trades yet. Run a scan, then click "Execute (Paper)" on an opportunity card.
+          </div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["Status", "When", "Type", "Market", "Shares", "Cost", "Realized", "P&L", ""].map(h => (
+                    <th key={h} style={{ textAlign: "left", padding: "8px 10px", color: C.muted, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.6px", fontWeight: 600, whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {journal.slice().reverse().map(e => (
+                  <tr key={e.id} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                    <td style={{ padding: "10px 10px" }}><Tag label={e.status.toUpperCase()} color={e.status === "open" ? C.cyan : C.muted} size="xs" /></td>
+                    <td style={{ padding: "10px 10px", color: C.dim, fontFamily: "IBM Plex Mono, monospace", whiteSpace: "nowrap" }}>{new Date(e.ts).toLocaleString()}</td>
+                    <td style={{ padding: "10px 10px" }}><Tag label={e.opp.type} color={C.purple} size="xs" /></td>
+                    <td style={{ padding: "10px 10px", color: C.text, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.opp.market}</td>
+                    <td style={{ padding: "10px 10px", color: C.text, fontFamily: "IBM Plex Mono, monospace" }}>{fmt(e.fill.shares, 1)}</td>
+                    <td style={{ padding: "10px 10px", color: C.amber, fontFamily: "IBM Plex Mono, monospace" }}>{money(e.fill.totalCost, 2)}</td>
+                    <td style={{ padding: "10px 10px", color: C.muted, fontFamily: "IBM Plex Mono, monospace" }}>{e.realizedAt != null ? money(e.realizedAt, 2) : "—"}</td>
+                    <td style={{ padding: "10px 10px", color: e.realizedPnl > 0 ? C.green : e.realizedPnl < 0 ? C.red : C.muted, fontFamily: "IBM Plex Mono, monospace", fontWeight: 700 }}>
+                      {e.realizedPnl != null ? `${e.realizedPnl >= 0 ? "+" : ""}${money(e.realizedPnl, 2)}` : "—"}
+                    </td>
+                    <td style={{ padding: "10px 10px", display: "flex", gap: 6 }}>
+                      {e.status === "open" && (
+                        <button onClick={() => closeTrade(e)} disabled={busyId === e.id} style={{
+                          background: C.amberDim, border: `1px solid ${C.amber}44`, color: C.amber,
+                          padding: "4px 10px", borderRadius: 3, fontSize: 10, fontWeight: 700, cursor: "pointer",
+                        }}>{busyId === e.id ? "…" : "CLOSE"}</button>
+                      )}
+                      <button onClick={() => removeTrade(e.id)} style={{ background: "none", border: "none", color: C.dim, cursor: "pointer", fontSize: 14, padding: "0 4px" }}>×</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// ─── Backtest Section ─────────────────────────────────────────────────────────
+// Pulls /prices-history for both legs of a detected opportunity and replays
+// the arb check at every historical sample to show how often the same edge
+// existed in the past. The current scanner has known limitations (top-60
+// markets sample, threshold heuristics, hand-curated dominance rules) — the
+// backtest is the only honest way to know whether it ever fires for real.
+function BacktestSection({ opps }) {
+  const [selectedId, setSelectedId] = useState(opps[0]?.id || "");
+  useEffect(() => { if (!selectedId && opps[0]) setSelectedId(opps[0].id); }, [opps, selectedId]);
+  const opp = opps.find(o => o.id === selectedId) || opps[0] || null;
+  const [historyRange, setHistoryRange] = useState("1m");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult]   = useState(null);
+  const [error, setError]     = useState("");
+
+  const run = async () => {
+    if (!opp?.leg1?.tokenId || !opp?.leg2?.tokenId) {
+      setError("Selected opportunity has no token IDs (likely loaded from fallback demo data).");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    try {
+      const [h1, h2] = await Promise.all([
+        fetchPricesHistory(opp.leg1.tokenId, { interval: historyRange, fidelity: 60 }),
+        fetchPricesHistory(opp.leg2.tokenId, { interval: historyRange, fidelity: 60 }),
+      ]);
+      if (!h1 || !h2 || !h1.length || !h2.length) {
+        setError("Polymarket returned empty history for one or both legs.");
+        setResult(null);
+      } else {
+        // For THRESH/MUTEX/DOMINANCE opps the "leg2 NO" price is captured as
+        // (1 - yesPrice). The history endpoint always returns the YES (or
+        // tracked-side) price, so we have to translate. tokenId on each leg
+        // is already the side we'd buy: yesTokenId for YES, noTokenId for NO.
+        // Each token's price stream is the price of its own side directly.
+        // So the buying cost for the pair at time t is just p1(t) + p2(t).
+        const sim = replayArb(h1, h2, (a, b) => a + b);
+        setResult(sim);
+      }
+    } catch (e) {
+      setError(String(e?.message || e));
+      setResult(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <Card style={{ padding: "16px 20px" }} accent={C.cyan}>
+        <div style={{ fontSize: 11, color: C.cyan, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 8 }}>⏱ HISTORICAL EDGE REPLAY</div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.7 }}>
+          Pulls Polymarket's <span style={{ fontFamily: "IBM Plex Mono, monospace", color: C.text }}>/prices-history</span> for both legs and counts how often the combined cost dropped below $1 — i.e., how often this exact arbitrage actually existed. If hit-rate is near zero, the strategy didn't pay historically and won't going forward.
+        </div>
+      </Card>
+
+      <Card style={{ padding: "16px 20px" }}>
+        <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14, textTransform: "uppercase" }}>Replay an Opportunity</div>
+        {opps.length === 0 ? (
+          <div style={{ fontSize: 12, color: C.muted, fontStyle: "italic" }}>
+            Run a scan first — backtest replays an opportunity captured by the scanner.
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div style={{ flex: "1 1 280px" }}>
+              <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>OPPORTUNITY</div>
+              <select value={selectedId} onChange={e => setSelectedId(e.target.value)}
+                style={{ width: "100%", background: C.surface2, border: `1px solid ${C.border}`, color: C.text, padding: "7px 10px", borderRadius: 4, fontSize: 12, height: 35, boxSizing: "border-box" }}>
+                {opps.map(o => (
+                  <option key={o.id} value={o.id}>{`[${o.type}] ${o.market}`}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>WINDOW</div>
+              <select value={historyRange} onChange={e => setHistoryRange(e.target.value)}
+                style={{ background: C.surface2, border: `1px solid ${C.border}`, color: C.text, padding: "7px 10px", borderRadius: 4, fontSize: 12, height: 35 }}>
+                <option value="1d">1 day</option>
+                <option value="1w">1 week</option>
+                <option value="1m">1 month</option>
+                <option value="max">Max</option>
+              </select>
+            </div>
+            <button onClick={run} disabled={loading || !opp} style={{
+              background: loading ? "none" : C.cyanDim, border: `1px solid ${loading ? C.border : C.cyan}66`,
+              color: loading ? C.muted : C.cyan, padding: "7px 16px", borderRadius: 4,
+              fontSize: 11, fontWeight: 700, cursor: loading ? "default" : "pointer",
+              fontFamily: "IBM Plex Mono, monospace", height: 35,
+            }}>{loading ? "REPLAYING…" : "▸ REPLAY"}</button>
+          </div>
+        )}
+        {error && (
+          <div style={{ marginTop: 12, padding: "8px 12px", background: C.redDim, border: `1px solid ${C.red}44`, borderRadius: 4, fontSize: 11, color: C.red, fontFamily: "IBM Plex Mono, monospace" }}>
+            {error}
+          </div>
+        )}
+      </Card>
+
+      {result && (
+        <Card style={{ padding: "16px 20px" }} accent={result.hits > 0 ? C.green : C.red}>
+          <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14 }}>RESULTS</div>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+            <MetricMini label="Samples" value={result.samples.toString()} color={C.text} />
+            <MetricMini label="Hit count" value={result.hits.toString()} color={result.hits > 0 ? C.green : C.red} />
+            <MetricMini label="Hit rate" value={`${(result.hitRate * 100).toFixed(1)}%`} color={result.hits > 0 ? C.green : C.red} />
+            <MetricMini label="Avg edge" value={`${(result.avgEdge * 100).toFixed(2)}¢`} color={C.amber} />
+            <MetricMini label="Max edge" value={`${(result.maxEdge * 100).toFixed(2)}¢`} color={C.purple} />
+          </div>
+          <div style={{ marginTop: 14, fontSize: 11, color: C.dim, fontStyle: "italic", lineHeight: 1.6 }}>
+            {result.hits === 0
+              ? "Zero hits in this window. The arb didn't exist historically — current scanner reading may be a transient quote anomaly or stale price."
+              : `Arb existed in ${(result.hitRate * 100).toFixed(1)}% of samples. Average realisable edge ${(result.avgEdge * 100).toFixed(2)}¢ per pair, peak ${(result.maxEdge * 100).toFixed(2)}¢.`}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 const TABS = [
-  { id: "api",    label: "Scanner", icon: "⇄" },
-  { id: "kelly",  label: "Kelly Sizer",     icon: "◎" },
-  { id: "claude", label: "CLAUDE.md",       icon: "⧫" },
+  { id: "api",      label: "Scanner",     icon: "⇄" },
+  { id: "backtest", label: "Backtest",    icon: "⏱" },
+  { id: "paper",    label: "Paper Trade", icon: "✎" },
+  { id: "kelly",    label: "Kelly Sizer", icon: "◎" },
+  { id: "claude",   label: "CLAUDE.md",   icon: "⧫" },
 ];
 
 export default function ArbBotV2() {
@@ -991,10 +1772,22 @@ export default function ArbBotV2() {
   // Counts of real scans completed and the most recent scan's market totals.
   const [scanCount, setScanCount] = useState(0);
   const [lastScan, setLastScan] = useState({ cross: 0, near: 0, status: "unknown" });
+  // Lifted so Backtest and Paper-Trade tabs can act on the latest scan's opps.
+  const [latestOpps, setLatestOpps] = useState([]);
+  // Paper-trade journal lives at the top so the Scanner can append from a
+  // per-opp button while the Paper tab reads the same array. localStorage is
+  // the canonical source; React state mirrors it.
+  const [paperJournal, setPaperJournal] = useState(loadPaperJournal);
+  useEffect(() => { savePaperJournal(paperJournal); }, [paperJournal]);
 
   const handleScanComplete = useCallback((info) => {
     setScanCount(c => c + 1);
-    setLastScan(info);
+    setLastScan({ cross: info.cross, near: info.near, status: info.status });
+    setLatestOpps(info.opportunities || []);
+  }, []);
+
+  const addPaperTrade = useCallback((entry) => {
+    setPaperJournal(j => [...j, entry]);
   }, []);
 
   return (
@@ -1067,9 +1860,11 @@ export default function ArbBotV2() {
 
       {/* Content */}
       <div style={{ padding: "24px", maxWidth: 980, margin: "0 auto" }}>
-        {tab === "api"    && <APIFeedSection onScanComplete={handleScanComplete} />}
-        {tab === "kelly"  && <KellySection />}
-        {tab === "claude" && <ClaudeMdSection />}
+        {tab === "api"      && <APIFeedSection onScanComplete={handleScanComplete} onPaperTrade={addPaperTrade} />}
+        {tab === "backtest" && <BacktestSection opps={latestOpps} />}
+        {tab === "paper"    && <PaperTradeSection journal={paperJournal} setJournal={setPaperJournal} />}
+        {tab === "kelly"    && <KellySection />}
+        {tab === "claude"   && <ClaudeMdSection />}
       </div>
 
       <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 24px", fontSize: 10, color: C.muted, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
