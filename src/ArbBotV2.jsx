@@ -264,6 +264,40 @@ function simulateTwoLegFill(book1, book2, maxBudgetUsd = 5000) {
   };
 }
 
+// Same two-leg fill, but fills up to `budgetUsd` regardless of whether the
+// trade is profitable at the margin. Used by the paper-trade journal so that
+// losing trades still get recorded — that's the whole point of having a
+// journal. The strict version above stays in place for the scanner card's
+// depth check.
+function simulateBudgetFill(book1, book2, budgetUsd) {
+  if (!book1?.asks?.length || !book2?.asks?.length) return null;
+  const c1 = buildCostCurve(book1.asks);
+  const c2 = buildCostCurve(book2.asks);
+  const maxS = Math.min(c1[c1.length - 1].shares, c2[c2.length - 1].shares);
+  if (maxS <= 0) return null;
+  let lo = 0, hi = maxS;
+  for (let iter = 0; iter < 60 && hi - lo > 1e-4; iter++) {
+    const mid = (lo + hi) / 2;
+    const cost = costForShares(c1, mid) + costForShares(c2, mid);
+    if (cost <= budgetUsd) lo = mid;
+    else hi = mid;
+  }
+  const shares = lo;
+  if (shares <= 0) return null;
+  const cost1 = costForShares(c1, shares);
+  const cost2 = costForShares(c2, shares);
+  const totalCost = cost1 + cost2;
+  const profit = shares - totalCost;
+  return {
+    shares,
+    cost1, cost2, totalCost,
+    avgPrice1: cost1 / shares,
+    avgPrice2: cost2 / shares,
+    profit,
+    roi: totalCost > 0 ? (profit / totalCost) * 100 : 0,
+  };
+}
+
 // ── Historical price fetch (backtester) ───────────────────────────────────────
 // Polymarket exposes /prices-history?market=<token_id>&interval=1m|1w|1d|6h|1h
 // — note `market` is the CLOB *token* id (not the condition_id). `fidelity` is
@@ -997,11 +1031,13 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
                     {opp.url1 && <a href={opp.url1} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 1 on Polymarket ↗</a>}
                     {opp.url2 && <a href={opp.url2} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 2 on Polymarket ↗</a>}
                     <button onClick={() => executePaper(opp)} disabled={paperBusy === opp.id || !opp.leg1?.tokenId || !opp.leg2?.tokenId} style={{
-                      background: C.amberDim, border: `1px solid ${C.amber}66`, color: C.amber,
+                      background: opp.depthOk === false ? C.redDim : C.amberDim,
+                      border: `1px solid ${opp.depthOk === false ? C.red : C.amber}66`,
+                      color: opp.depthOk === false ? C.red : C.amber,
                       padding: "3px 10px", borderRadius: 3, fontSize: 10, fontWeight: 700,
                       cursor: (paperBusy === opp.id || !opp.leg1?.tokenId) ? "default" : "pointer",
                       fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.3px",
-                    }}>{paperBusy === opp.id ? "FILLING…" : "✎ EXECUTE (PAPER)"}</button>
+                    }}>{paperBusy === opp.id ? "FILLING…" : opp.depthOk === false ? "✎ RECORD LOSS (PAPER)" : "✎ EXECUTE (PAPER)"}</button>
                     {paperMsg && paperMsg.id === opp.id && (
                       <span style={{ fontSize: 10, color: paperMsg.type === "ok" ? C.green : C.red, fontFamily: "IBM Plex Mono, monospace" }}>
                         {paperMsg.type === "ok" ? "✓ " : "✗ "}{paperMsg.text}
@@ -1480,13 +1516,19 @@ function savePaperJournal(entries) {
 
 // Snap the live orderbook for both legs and compute the realized fill at
 // `budgetUsd`. Used both for "open paper trade" and "close paper trade".
+// Uses the budget-bound simulator (not the strict arb-only one) so that
+// losing trades still get recorded in the journal.
 async function snapTwoLegFill(opp, budgetUsd) {
   if (!opp?.leg1?.tokenId || !opp?.leg2?.tokenId) {
     return { ok: false, reason: "missing token IDs" };
   }
   const [b1, b2] = await Promise.all([fetchBook(opp.leg1.tokenId), fetchBook(opp.leg2.tokenId)]);
-  const sim = simulateTwoLegFill(b1, b2, budgetUsd);
-  if (!sim || sim.shares <= 0) return { ok: false, reason: "no fillable depth" };
+  if (b1 == null) return { ok: false, reason: "could not fetch leg 1 orderbook (network or stale token id)" };
+  if (b2 == null) return { ok: false, reason: "could not fetch leg 2 orderbook (network or stale token id)" };
+  if (!b1.asks?.length) return { ok: false, reason: "leg 1 has no asks — book is empty on the buy side" };
+  if (!b2.asks?.length) return { ok: false, reason: "leg 2 has no asks — book is empty on the buy side" };
+  const sim = simulateBudgetFill(b1, b2, budgetUsd);
+  if (!sim || sim.shares <= 0) return { ok: false, reason: "books are empty above the budget cap" };
   return {
     ok: true,
     shares:    sim.shares,
@@ -1497,6 +1539,7 @@ async function snapTwoLegFill(opp, budgetUsd) {
     avgPrice2: sim.avgPrice2,
     profit:    sim.profit,
     roi:       sim.roi,
+    wasProfitableAtFill: sim.profit > 0,
     snapTs:    Date.now(),
   };
 }
@@ -1607,7 +1650,19 @@ function PaperTradeSection({ journal, setJournal }) {
               <tbody>
                 {journal.slice().reverse().map(e => (
                   <tr key={e.id} style={{ borderBottom: `1px solid ${C.border}22` }}>
-                    <td style={{ padding: "10px 10px" }}><Tag label={e.status.toUpperCase()} color={e.status === "open" ? C.cyan : C.muted} size="xs" /></td>
+                    <td style={{ padding: "10px 10px", whiteSpace: "nowrap" }}>
+                      <Tag label={e.status.toUpperCase()} color={e.status === "open" ? C.cyan : C.muted} size="xs" />
+                      {e.fill?.wasProfitableAtFill != null && (
+                        <span title={e.fill.wasProfitableAtFill ? "Profitable arb at fill time" : "Recorded loss — fill cost > $1 per pair"}
+                              style={{
+                                marginLeft: 6,
+                                color: e.fill.wasProfitableAtFill ? C.green : C.red,
+                                fontFamily: "IBM Plex Mono, monospace",
+                                fontWeight: 700,
+                                fontSize: 11,
+                              }}>{e.fill.wasProfitableAtFill ? "✓" : "✗"}</span>
+                      )}
+                    </td>
                     <td style={{ padding: "10px 10px", color: C.dim, fontFamily: "IBM Plex Mono, monospace", whiteSpace: "nowrap" }}>{new Date(e.ts).toLocaleString()}</td>
                     <td style={{ padding: "10px 10px" }}><Tag label={e.opp.type} color={C.purple} size="xs" /></td>
                     <td style={{ padding: "10px 10px", color: C.text, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.opp.market}</td>
