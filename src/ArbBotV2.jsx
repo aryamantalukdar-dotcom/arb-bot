@@ -104,25 +104,50 @@ const FALLBACK_POLY = [
 ];
 
 // ── Real Polymarket CLOB fetch (CORS-friendly) ────────────────────────────────
-// Step 1: sampling-simplified-markets → live prices + condition_ids (active only)
-// Step 2: parallel per-market detail fetch → question, slug, volume, endDate
-async function fetchPolymarkets(limit = 60) {
-  const simplResp = await fetch(
-    `${CLOB_BASE}/sampling-simplified-markets?limit=${limit}`,
-    { headers: { Accept: "application/json" } }
-  );
-  if (!simplResp.ok) throw new Error(`CLOB ${simplResp.status}`);
-  const { data: items = [] } = await simplResp.json();
+// Step 1: sampling-simplified-markets → live prices + condition_ids (active only).
+//   Paginates via `next_cursor` until exhausted or `maxMarkets` is reached.
+//   Polymarket's per-page cap is ~500; loop until the server signals end-of-feed
+//   (no next_cursor, "LTE=" sentinel, or empty page).
+// Step 2: per-market detail fetch in chunks → question, slug, volume, endDate.
+//   Fan-out is capped at DETAIL_CONCURRENCY parallel requests so a 2,000-market
+//   scan doesn't fire 2,000 simultaneous fetches and trip rate limits / browser
+//   connection caps.
+async function fetchPolymarkets(maxMarkets = 500) {
+  const PAGE_SIZE = 500;
+  const DETAIL_CONCURRENCY = 25;
+  const MAX_PAGES = 50; // hard safety cap (50 × 500 = 25k markets max)
 
-  const details = await Promise.all(
-    items.map(item =>
+  const items = [];
+  let cursor = "";
+  for (let page = 0; page < MAX_PAGES && items.length < maxMarkets; page++) {
+    const url = `${CLOB_BASE}/sampling-simplified-markets?limit=${PAGE_SIZE}` +
+      (cursor ? `&next_cursor=${encodeURIComponent(cursor)}` : "");
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!r.ok) {
+      if (page === 0) throw new Error(`CLOB ${r.status}`);
+      break; // partial pages are fine — return what we have
+    }
+    const j = await r.json();
+    const data = Array.isArray(j.data) ? j.data : [];
+    items.push(...data);
+    const nextCursor = j.next_cursor;
+    if (!nextCursor || nextCursor === "LTE=" || data.length === 0) break;
+    cursor = nextCursor;
+  }
+  const trimmed = items.slice(0, maxMarkets);
+
+  const details = new Array(trimmed.length);
+  for (let i = 0; i < trimmed.length; i += DETAIL_CONCURRENCY) {
+    const chunk = trimmed.slice(i, i + DETAIL_CONCURRENCY);
+    const got = await Promise.all(chunk.map(item =>
       fetch(`${CLOB_BASE}/markets/${item.condition_id}`, { headers: { Accept: "application/json" } })
         .then(r => r.ok ? r.json() : null)
         .catch(() => null)
-    )
-  );
+    ));
+    for (let k = 0; k < got.length; k++) details[i + k] = got[k];
+  }
 
-  return items.map((item, i) => {
+  return trimmed.map((item, i) => {
     const d = details[i];
     if (!d?.question) return null;
     // Strict binary YES/NO matching. Non-binary markets are skipped — the old
@@ -414,17 +439,20 @@ async function fanOutNotifications({ desktop, webhookUrl, minRoi, opportunities 
 
 // ── Polymarket API client with 30s cache + fallback ───────────────────────────
 // Returns { markets, status } so the caller can lift status into React state.
+// The cache is keyed by maxMarkets so changing the slider doesn't return stale
+// shorter-than-requested results.
 const polymarketAPI = {
-  _cache: null, _cacheTs: 0, _cacheStatus: "unknown",
-  async getMarkets() {
-    if (this._cache && Date.now() - this._cacheTs < 30000) {
-      return { markets: this._cache, status: this._cacheStatus };
+  _cache: null, _cacheTs: 0, _cacheStatus: "unknown", _cacheMax: 0,
+  async getMarkets(maxMarkets = 500) {
+    if (this._cache && this._cacheMax >= maxMarkets && Date.now() - this._cacheTs < 30000) {
+      return { markets: this._cache.slice(0, maxMarkets), status: this._cacheStatus };
     }
     try {
-      const markets = await fetchPolymarkets();
+      const markets = await fetchPolymarkets(maxMarkets);
       this._cache = markets;
       this._cacheTs = Date.now();
       this._cacheStatus = "live";
+      this._cacheMax = maxMarkets;
       return { markets, status: "live" };
     } catch {
       const fallback = FALLBACK_POLY.map(m => {
@@ -434,6 +462,7 @@ const polymarketAPI = {
       this._cache = fallback;
       this._cacheTs = Date.now();
       this._cacheStatus = "demo";
+      this._cacheMax = fallback.length;
       return { markets: fallback, status: "demo" };
     }
   },
@@ -493,8 +522,8 @@ function extractThreshold(text) {
   return n;
 }
 
-async function scanLogicArb() {
-  const { markets, status } = await polymarketAPI.getMarkets();
+async function scanLogicArb(maxMarkets = 500) {
+  const { markets, status } = await polymarketAPI.getMarkets(maxMarkets);
   const isLive = status === "live";
   const opportunities = [];
 
@@ -696,8 +725,8 @@ async function scanLogicArb() {
 }
 
 // Near-resolution scanner
-async function scanNearResolution() {
-  const { markets: polyMarkets, status } = await polymarketAPI.getMarkets();
+async function scanNearResolution(maxMarkets = 500) {
+  const { markets: polyMarkets, status } = await polymarketAPI.getMarkets(maxMarkets);
   const isLive = status === "live";
   const results = [];
 
@@ -782,9 +811,7 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
   const [nearOpps, setNearOpps] = useState([]);
   const [apiStat, setApiStat] = useState("unknown"); // "unknown" | "live" | "demo"
   const [apiLog, setApiLog] = useState([
-    { ts: "09:41:22", method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: 200, ms: 187, source: "CLOB" },
-    { ts: "09:41:23", method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: 200, ms: 310, source: "CLOB" },
-    { ts: "09:41:23", method: "SCAN", endpoint: "logic-arb-engine: threshold + mutex", status: "OK", ms: 12, source: "SCANNER" },
+    { ts: "—", method: "SCAN", endpoint: "Click RUN SCAN NOW to fetch live Polymarket data", status: "STANDBY", ms: null, source: "SCANNER" },
   ]);
 
   // Notification settings persisted in localStorage. The webhook URL is
@@ -805,6 +832,7 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
   const [paperBusy, setPaperBusy] = useState(null);
   const [paperMsg, setPaperMsg]   = useState(null); // { id, type: "ok" | "err", text }
   const [paperBudget, setPaperBudget] = useState(500); // USDC per paper trade
+  const [maxMarkets, setMaxMarkets]   = useState(500); // markets sampled per scan
 
   // Request-id guard: only the latest scan is allowed to write state.
   // Prevents double-clicks and unmount-during-fetch from stomping results.
@@ -848,16 +876,18 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
 
   const runScan = async () => {
     const myId = ++reqIdRef.current;
+    const requested = Math.max(60, Math.min(5000, Number(maxMarkets) || 500));
     setScanLoading(true);
     const start = Date.now();
+    const pages = Math.ceil(requested / 500);
     setApiLog(prev => [
-      { ts: nowTs(), method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: "...", ms: null, source: "CLOB" },
-      { ts: nowTs(), method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: "...", ms: null, source: "CLOB" },
+      { ts: nowTs(), method: "GET", endpoint: `/sampling-simplified-markets ×${pages} pages (limit ${requested})`, status: "...", ms: null, source: "CLOB" },
+      { ts: nowTs(), method: "GET", endpoint: `/markets/{condition_id} ×${requested} (chunked, 25 in flight)`, status: "...", ms: null, source: "CLOB" },
       ...prev,
     ]);
 
     try {
-      const [crossRes, nearRes] = await Promise.all([scanLogicArb(), scanNearResolution()]);
+      const [crossRes, nearRes] = await Promise.all([scanLogicArb(requested), scanNearResolution(requested)]);
       if (!mountedRef.current || myId !== reqIdRef.current) return;
       const elapsed = Date.now() - start;
       const status = crossRes.status || nearRes.status || "unknown";
@@ -944,6 +974,11 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
             onChange={e => setPaperBudget(parseFloat(e.target.value) || 0)}
             title="USDC notional used by Execute (Paper) per click"
             style={{ width: 100, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.amber, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace" }} />
+          <span style={{ fontSize: 10, color: C.muted, fontFamily: "IBM Plex Mono, monospace", marginLeft: 8 }}>MAX MARKETS</span>
+          <input type="number" min="60" max="5000" step="100" value={maxMarkets}
+            onChange={e => setMaxMarkets(parseInt(e.target.value, 10) || 500)}
+            title="Max active markets pulled per scan. Larger values widen coverage but take longer (≈1s per 100 markets). Hard cap 5000."
+            style={{ width: 100, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.cyan, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace" }} />
         </div>
       </Card>
 
