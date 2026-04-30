@@ -30,7 +30,38 @@ const C = {
 const fmt   = (n, d = 2) => Number(n).toFixed(d);
 const pct   = (n) => `${fmt(Number(n) * 100, 1)}%`;
 const money = (n, d = 2) => `$${fmt(n, d)}`;
+// Signed formatters: always render an explicit + / − so the sign isn't conveyed
+// by colour alone (accessibility for low-vision and colour-blind users).
+const signedPct   = (n, d = 2) => `${Number(n) >= 0 ? "+" : "−"}${fmt(Math.abs(Number(n)), d)}%`;
+const signedMoney = (n, d = 2) => `${Number(n) >= 0 ? "+" : "−"}$${fmt(Math.abs(Number(n)), d)}`;
 const nowTs = () => { const d = new Date(); return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}`; };
+
+// localStorage schema version — bump when a key's shape changes so old payloads
+// can be detected and cleared/migrated. Today migration is opportunistic: a
+// mismatched version just falls back to the default.
+const LS_SCHEMA = 1;
+const LS_PREFIX = "arbbot.";
+
+// useState backed by localStorage. JSON-encoded; falls back to defaultValue on
+// parse error or schema mismatch. Pattern mirrors the existing notif/journal
+// loaders elsewhere in the file but is reusable.
+function useLocalStorage(key, defaultValue) {
+  const fullKey = LS_PREFIX + key;
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = localStorage.getItem(fullKey);
+      if (raw == null) return defaultValue;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.__v !== LS_SCHEMA) return defaultValue;
+      return parsed && typeof parsed === "object" && "value" in parsed ? parsed.value : parsed;
+    } catch { return defaultValue; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(fullKey, JSON.stringify({ __v: LS_SCHEMA, value })); }
+    catch { /* quota / private mode — ignore */ }
+  }, [fullKey, value]);
+  return [value, setValue];
+}
 
 const RISK_COLOR = { low: C.green, medium: C.amber, high: C.red, critical: C.red };
 const TYPE_COLOR = { LOGIC_ARB: C.blue, NEAR_RES: C.green, LOGIC: C.purple, KELLY: C.amber };
@@ -104,25 +135,54 @@ const FALLBACK_POLY = [
 ];
 
 // ── Real Polymarket CLOB fetch (CORS-friendly) ────────────────────────────────
-// Step 1: sampling-simplified-markets → live prices + condition_ids (active only)
-// Step 2: parallel per-market detail fetch → question, slug, volume, endDate
-async function fetchPolymarkets(limit = 60) {
-  const simplResp = await fetch(
-    `${CLOB_BASE}/sampling-simplified-markets?limit=${limit}`,
-    { headers: { Accept: "application/json" } }
-  );
-  if (!simplResp.ok) throw new Error(`CLOB ${simplResp.status}`);
-  const { data: items = [] } = await simplResp.json();
+// Step 1: sampling-simplified-markets → live prices + condition_ids (active only).
+//   Paginates via `next_cursor` until exhausted or `maxMarkets` is reached.
+//   Polymarket's per-page cap is ~500; loop until the server signals end-of-feed
+//   (no next_cursor, "LTE=" sentinel, or empty page).
+// Step 2: per-market detail fetch in chunks → question, slug, volume, endDate.
+//   Fan-out is capped at DETAIL_CONCURRENCY parallel requests so a 2,000-market
+//   scan doesn't fire 2,000 simultaneous fetches and trip rate limits / browser
+//   connection caps.
+async function fetchPolymarkets(maxMarkets = 500) {
+  const PAGE_SIZE = 500;
+  const DETAIL_CONCURRENCY = 25;
+  const MAX_PAGES = 50; // hard safety cap (50 × 500 = 25k markets max)
 
-  const details = await Promise.all(
-    items.map(item =>
+  const items = [];
+  let cursor = "";
+  for (let page = 0; page < MAX_PAGES && items.length < maxMarkets; page++) {
+    const url = `${CLOB_BASE}/sampling-simplified-markets?limit=${PAGE_SIZE}` +
+      (cursor ? `&next_cursor=${encodeURIComponent(cursor)}` : "");
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!r.ok) {
+      if (page === 0) throw new Error(`CLOB ${r.status}`);
+      break; // partial pages are fine — return what we have
+    }
+    const j = await r.json();
+    const data = Array.isArray(j.data) ? j.data : [];
+    items.push(...data);
+    const nextCursor = j.next_cursor;
+    if (!nextCursor || nextCursor === "LTE=" || data.length === 0) break;
+    cursor = nextCursor;
+  }
+  const trimmed = items.slice(0, maxMarkets);
+
+  const details = new Array(trimmed.length);
+  let failedDetails = 0;
+  for (let i = 0; i < trimmed.length; i += DETAIL_CONCURRENCY) {
+    const chunk = trimmed.slice(i, i + DETAIL_CONCURRENCY);
+    const got = await Promise.all(chunk.map(item =>
       fetch(`${CLOB_BASE}/markets/${item.condition_id}`, { headers: { Accept: "application/json" } })
         .then(r => r.ok ? r.json() : null)
         .catch(() => null)
-    )
-  );
+    ));
+    for (let k = 0; k < got.length; k++) {
+      details[i + k] = got[k];
+      if (got[k] == null) failedDetails++;
+    }
+  }
 
-  return items.map((item, i) => {
+  const out = trimmed.map((item, i) => {
     const d = details[i];
     if (!d?.question) return null;
     // Strict binary YES/NO matching. Non-binary markets are skipped — the old
@@ -153,14 +213,30 @@ async function fetchPolymarkets(limit = 60) {
       eventId,
     };
   }).filter(m => m && m.question && m.outcomePrices[0] > 0.001 && m.outcomePrices[0] < 0.999);
+
+  // Attach a stats sidecar so callers can surface partial failures without
+  // changing the array shape (kept non-enumerable to avoid leaking into JSON).
+  Object.defineProperty(out, "_stats", {
+    enumerable: false,
+    value: { fetched: trimmed.length, failedDetails, kept: out.length },
+  });
+  return out;
 }
 
 // ── Orderbook depth fetch + slippage walker ──────────────────────────────────
 // /book returns { bids: [{price, size}], asks: [{price, size}] } where
 // `price` is per-share USDC and `size` is the quantity of shares offered at
 // that price. Bids are sorted highest-first, asks lowest-first.
+//
+// Cache: depth-pass and the paper-trade button both fetch the same books
+// seconds apart. A small 5-second TTL eliminates the duplicate without
+// risking staleness — orderbooks at this granularity barely move in 5s.
+const BOOK_CACHE_TTL_MS = 5000;
+const _bookCache = new Map(); // tokenId → { ts, book }
 async function fetchBook(tokenId) {
   if (!tokenId) return null;
+  const cached = _bookCache.get(tokenId);
+  if (cached && Date.now() - cached.ts < BOOK_CACHE_TTL_MS) return cached.book;
   try {
     const r = await fetch(`${CLOB_BASE}/book?token_id=${encodeURIComponent(tokenId)}`, { headers: { Accept: "application/json" } });
     if (!r.ok) return null;
@@ -169,7 +245,9 @@ async function fetchBook(tokenId) {
       price: parseFloat(l.price),
       size:  parseFloat(l.size),
     })).filter(l => Number.isFinite(l.price) && Number.isFinite(l.size) && l.size > 0);
-    return { bids: norm("bids"), asks: norm("asks") };
+    const book = { bids: norm("bids"), asks: norm("asks") };
+    _bookCache.set(tokenId, { ts: Date.now(), book });
+    return book;
   } catch {
     return null;
   }
@@ -413,29 +491,47 @@ async function fanOutNotifications({ desktop, webhookUrl, minRoi, opportunities 
 }
 
 // ── Polymarket API client with 30s cache + fallback ───────────────────────────
-// Returns { markets, status } so the caller can lift status into React state.
+// Returns { markets, status, stats } so the caller can lift status into React
+// state and surface partial-failure stats. The cache is keyed by maxMarkets so
+// changing the slider doesn't return stale shorter-than-requested results.
+// `_inflight` deduplicates concurrent calls (stampede guard) — two rapid scan
+// clicks will share the same network request instead of doubling the load.
 const polymarketAPI = {
-  _cache: null, _cacheTs: 0, _cacheStatus: "unknown",
-  async getMarkets() {
-    if (this._cache && Date.now() - this._cacheTs < 30000) {
-      return { markets: this._cache, status: this._cacheStatus };
+  _cache: null, _cacheTs: 0, _cacheStatus: "unknown", _cacheMax: 0, _cacheStats: null,
+  _inflight: null,
+  async getMarkets(maxMarkets = 500) {
+    if (this._cache && this._cacheMax >= maxMarkets && Date.now() - this._cacheTs < 30000) {
+      return {
+        markets: this._cache.slice(0, maxMarkets),
+        status:  this._cacheStatus,
+        stats:   this._cacheStats,
+      };
     }
-    try {
-      const markets = await fetchPolymarkets();
-      this._cache = markets;
-      this._cacheTs = Date.now();
-      this._cacheStatus = "live";
-      return { markets, status: "live" };
-    } catch {
-      const fallback = FALLBACK_POLY.map(m => {
-        const y = Math.max(0.01, Math.min(0.99, m.outcomePrices[0] + (Math.random() - 0.5) * 0.015));
-        return { ...m, outcomePrices: [+y.toFixed(3), +(1 - y).toFixed(3)], eventId: null };
-      });
-      this._cache = fallback;
-      this._cacheTs = Date.now();
-      this._cacheStatus = "demo";
-      return { markets: fallback, status: "demo" };
-    }
+    if (this._inflight) return this._inflight;
+    this._inflight = (async () => {
+      try {
+        const markets = await fetchPolymarkets(maxMarkets);
+        this._cache = markets;
+        this._cacheTs = Date.now();
+        this._cacheStatus = "live";
+        this._cacheMax = maxMarkets;
+        this._cacheStats = markets._stats || null;
+        return { markets, status: "live", stats: this._cacheStats };
+      } catch {
+        const fallback = FALLBACK_POLY.map(m => {
+          const y = Math.max(0.01, Math.min(0.99, m.outcomePrices[0] + (Math.random() - 0.5) * 0.015));
+          return { ...m, outcomePrices: [+y.toFixed(3), +(1 - y).toFixed(3)], eventId: null };
+        });
+        this._cache = fallback;
+        this._cacheTs = Date.now();
+        this._cacheStatus = "demo";
+        this._cacheMax = fallback.length;
+        this._cacheStats = null;
+        return { markets: fallback, status: "demo", stats: null };
+      }
+    })();
+    try { return await this._inflight; }
+    finally { this._inflight = null; }
   },
 };
 
@@ -481,20 +577,66 @@ const DOMINANCE_RULES = [
   },
 ];
 
-// Extract numeric threshold from question text ("$80,000" → 80000, "3.5%" → 3.5)
+// Extract numeric threshold from question text ("$80,000" → 80000, "3.5%" → 3.5).
+// Strategy:
+//   1. Prefer numbers that follow a comparison verb / operator within a few
+//      tokens — these are almost always the actual threshold.
+//   2. Fall back to numbers preceded by "$" or trailed by a unit suffix
+//      (k/m/b/%) — also strongly indicative of a threshold.
+//   3. Only as a last resort, take the first number — but skip 4-digit values
+//      in the 1900–2099 range (year contamination from "by March 2026").
+// The previous implementation just took the first number, which silently
+// misclassified questions like "Will CPI be below 3.5% in March 2026?" by
+// extracting "2026" or "3" instead of 3.5 and corrupting Pattern A grouping.
 function extractThreshold(text) {
-  const m = text.match(/\$?([\d,]+(?:\.\d+)?)\s*([kKmMbB%]?)/);
-  if (!m) return null;
-  let n = parseFloat(m[1].replace(/,/g, ""));
-  const suffix = m[2].toLowerCase();
-  if (suffix === "k") n *= 1e3;
-  else if (suffix === "m") n *= 1e6;
-  else if (suffix === "b") n *= 1e9;
-  return n;
+  if (!text) return null;
+  const NUM = "(\\$?[\\d,]+(?:\\.\\d+)?)([kKmMbB%]?)";
+  const parseMatch = (raw, suf) => {
+    const cleaned = raw.replace(/[$,]/g, "");
+    let n = parseFloat(cleaned);
+    if (!Number.isFinite(n)) return null;
+    const s = (suf || "").toLowerCase();
+    if (s === "k") n *= 1e3;
+    else if (s === "m") n *= 1e6;
+    else if (s === "b") n *= 1e9;
+    return n;
+  };
+  const isYearLike = (n, raw) =>
+    /^\d{4}$/.test(raw.replace(/[$,]/g, "")) && n >= 1900 && n <= 2099;
+
+  // 1. Comparison-verb proximity — strongest signal.
+  const cmpRe = new RegExp(
+    "\\b(?:above|below|over|under|exceed(?:s|ed)?|reach(?:es|ed)?|hit(?:s)?|cross(?:es|ed)?|surpass(?:es|ed)?|≥|≤|>=|<=|>|<|at\\s+least|at\\s+most|more\\s+than|less\\s+than)\\s+" + NUM,
+    "i",
+  );
+  const cmp = text.match(cmpRe);
+  if (cmp) {
+    const n = parseMatch(cmp[1], cmp[2]);
+    if (n != null && !isYearLike(n, cmp[1])) return n;
+  }
+
+  // 2. Currency-marked or unit-suffixed numbers anywhere in the text.
+  const unitRe = /(\$[\d,]+(?:\.\d+)?)([kKmMbB%]?)|([\d,]+(?:\.\d+)?)([kKmMbB%])/g;
+  let u;
+  while ((u = unitRe.exec(text)) !== null) {
+    const raw = u[1] || u[3];
+    const suf = u[2] || u[4];
+    const n = parseMatch(raw, suf);
+    if (n != null && !isYearLike(n, raw)) return n;
+  }
+
+  // 3. Fallback — first plain number, skipping year-range integers.
+  const allRe = /([\d,]+(?:\.\d+)?)([kKmMbB%]?)/g;
+  let m;
+  while ((m = allRe.exec(text)) !== null) {
+    const n = parseMatch(m[1], m[2]);
+    if (n != null && !isYearLike(n, m[1])) return n;
+  }
+  return null;
 }
 
-async function scanLogicArb() {
-  const { markets, status } = await polymarketAPI.getMarkets();
+async function scanLogicArb(maxMarkets = 500) {
+  const { markets, status, stats } = await polymarketAPI.getMarkets(maxMarkets);
   const isLive = status === "live";
   const opportunities = [];
 
@@ -692,12 +834,12 @@ async function scanLogicArb() {
     top[k].depthOk     = sim.profit > 0.5; // arbitrary $0.50 floor of realizable profit
   }
 
-  return { opportunities: top, status };
+  return { opportunities: top, status, stats };
 }
 
 // Near-resolution scanner
-async function scanNearResolution() {
-  const { markets: polyMarkets, status } = await polymarketAPI.getMarkets();
+async function scanNearResolution(maxMarkets = 500) {
+  const { markets: polyMarkets, status } = await polymarketAPI.getMarkets(maxMarkets);
   const isLive = status === "live";
   const results = [];
 
@@ -776,35 +918,32 @@ function calcPortfolioKelly(positions, bankroll) {
 // ─── Sections ─────────────────────────────────────────────────────────────────
 
 // API Feed Panel
-function APIFeedSection({ onScanComplete, onPaperTrade }) {
+function APIFeedSection({ onScanComplete, onPaperTrade, onBacktestOpp }) {
   const [scanLoading, setScanLoading] = useState(false);
   const [crossOpps, setCrossOpps] = useState([]);
   const [nearOpps, setNearOpps] = useState([]);
   const [apiStat, setApiStat] = useState("unknown"); // "unknown" | "live" | "demo"
+  const [scanStats, setScanStats] = useState(null); // { fetched, kept, failed, degraded } | null
+  // Pagination — fresh scan resets to "show only top N" so the user isn't
+  // dumped into a long list of stale results.
+  const [showAllCross, setShowAllCross] = useState(false);
+  const [showAllNear,  setShowAllNear]  = useState(false);
   const [apiLog, setApiLog] = useState([
-    { ts: "09:41:22", method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: 200, ms: 187, source: "CLOB" },
-    { ts: "09:41:23", method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: 200, ms: 310, source: "CLOB" },
-    { ts: "09:41:23", method: "SCAN", endpoint: "logic-arb-engine: threshold + mutex", status: "OK", ms: 12, source: "SCANNER" },
+    { ts: "—", method: "SCAN", endpoint: "Click RUN SCAN NOW to fetch live Polymarket data", status: "STANDBY", ms: null, source: "SCANNER" },
   ]);
 
   // Notification settings persisted in localStorage. The webhook URL is
   // optional and used for Discord/Slack/Telegram-bot-style POSTs.
-  const [notif, setNotif] = useState(() => {
-    try {
-      const raw = localStorage.getItem("arbbot.notify");
-      if (raw) return JSON.parse(raw);
-    } catch { /* ignore */ }
-    return { desktop: false, webhookUrl: "", minRoi: 2.0 };
-  });
-  useEffect(() => {
-    try { localStorage.setItem("arbbot.notify", JSON.stringify(notif)); } catch { /* ignore */ }
-  }, [notif]);
+  const [notif, setNotif] = useLocalStorage("notify", { desktop: false, webhookUrl: "", minRoi: 2.0 });
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
 
   // Per-opp "Execute (Paper)" busy/feedback state, keyed by opportunity id.
   const [paperBusy, setPaperBusy] = useState(null);
   const [paperMsg, setPaperMsg]   = useState(null); // { id, type: "ok" | "err", text }
-  const [paperBudget, setPaperBudget] = useState(500); // USDC per paper trade
+  const [paperBudget, setPaperBudget] = useLocalStorage("paperBudget", 500);
+  const [maxMarkets, setMaxMarkets]   = useLocalStorage("maxMarkets", 500);
+  // Tag-legend collapse state — sticky so power users only ever see it once.
+  const [legendOpen, setLegendOpen]   = useLocalStorage("legendOpen", true);
 
   // Request-id guard: only the latest scan is allowed to write state.
   // Prevents double-clicks and unmount-during-fetch from stomping results.
@@ -848,16 +987,18 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
 
   const runScan = async () => {
     const myId = ++reqIdRef.current;
+    const requested = Math.max(60, Math.min(5000, Number(maxMarkets) || 500));
     setScanLoading(true);
     const start = Date.now();
+    const pages = Math.ceil(requested / 500);
     setApiLog(prev => [
-      { ts: nowTs(), method: "GET", endpoint: "/sampling-simplified-markets?limit=60", status: "...", ms: null, source: "CLOB" },
-      { ts: nowTs(), method: "GET", endpoint: "/markets/{condition_id} ×60 parallel", status: "...", ms: null, source: "CLOB" },
+      { ts: nowTs(), method: "GET", endpoint: `/sampling-simplified-markets ×${pages} pages (limit ${requested})`, status: "...", ms: null, source: "CLOB" },
+      { ts: nowTs(), method: "GET", endpoint: `/markets/{condition_id} ×${requested} (chunked, 25 in flight)`, status: "...", ms: null, source: "CLOB" },
       ...prev,
     ]);
 
     try {
-      const [crossRes, nearRes] = await Promise.all([scanLogicArb(), scanNearResolution()]);
+      const [crossRes, nearRes] = await Promise.all([scanLogicArb(requested), scanNearResolution(requested)]);
       if (!mountedRef.current || myId !== reqIdRef.current) return;
       const elapsed = Date.now() - start;
       const status = crossRes.status || nearRes.status || "unknown";
@@ -866,6 +1007,8 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
       setApiStat(status);
       setCrossOpps(cross);
       setNearOpps(near);
+      setShowAllCross(false);
+      setShowAllNear(false);
       onScanComplete?.({ cross: cross.length, near: near.length, status, opportunities: cross });
       // Fan-out notifications for opps clearing the user's ROI threshold. Best
       // effort: failures here don't break the scan.
@@ -877,15 +1020,27 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
           opportunities: cross,
         });
       }
+      const stats = crossRes.stats || null;
+      const failed = stats?.failedDetails || 0;
+      const fetched = stats?.fetched || 0;
+      const failPct = fetched > 0 ? failed / fetched : 0;
+      const degraded = failPct > 0.05; // surface to user when >5% of detail fetches dropped
       setApiLog(prev => {
         const updated = [...prev];
         updated[0] = { ...updated[0], status: 200, ms: Math.round(elapsed * 0.55) };
-        updated[1] = { ...updated[1], status: 200, ms: Math.round(elapsed * 0.65) };
-        return [
-          { ts: nowTs(), method: "SCAN", endpoint: `→ ${cross.length} logic arb + ${near.length} near-res opportunities`, status: "OK", ms: elapsed, source: "SCANNER" },
-          ...updated,
-        ].slice(0, 20);
+        updated[1] = { ...updated[1], status: degraded ? 207 : 200, ms: Math.round(elapsed * 0.65) };
+        const lines = [];
+        if (degraded) {
+          lines.push({
+            ts: nowTs(), method: "WARN",
+            endpoint: `Degraded scan — ${failed}/${fetched} markets dropped (${(failPct * 100).toFixed(1)}% failed detail fetches)`,
+            status: "DEGRADED", ms: null, source: "SCANNER",
+          });
+        }
+        lines.push({ ts: nowTs(), method: "SCAN", endpoint: `→ ${cross.length} logic arb + ${near.length} near-res opportunities`, status: "OK", ms: elapsed, source: "SCANNER" });
+        return [...lines, ...updated].slice(0, 20);
       });
+      setScanStats({ fetched, kept: stats?.kept || 0, failed, degraded });
     } catch(e) {
       if (!mountedRef.current || myId !== reqIdRef.current) return;
       setApiLog(prev => [
@@ -897,10 +1052,56 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
     }
   };
 
-  const statusColor = { 200: C.green, "OK": C.green, "...": C.amber, 500: C.red };
+  const statusColor = { 200: C.green, 207: C.amber, "OK": C.green, "DEGRADED": C.amber, "STANDBY": C.muted, "...": C.amber, 500: C.red };
+
+  const hasResults = crossOpps.length > 0 || nearOpps.length > 0;
+  const isFirstVisit = !hasResults && !scanLoading && apiStat === "unknown";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* First-visit quickstart — only when no scan has run yet */}
+      {isFirstVisit && (
+        <Card style={{ padding: "18px 22px" }} accent={C.green}>
+          <div style={{ fontSize: 11, color: C.green, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 10 }}>★ QUICK START</div>
+          <div style={{ fontSize: 13, color: C.text, lineHeight: 1.6, marginBottom: 12 }}>
+            This scanner finds price inconsistencies across Polymarket markets where the math doesn't add up — the kind of mispricing where you can buy both legs and lock in a profit before resolution. Three steps to your first paper trade:
+          </div>
+          <ol style={{ margin: 0, padding: "0 0 0 20px", color: C.muted, fontSize: 12, lineHeight: 1.9 }}>
+            <li>Click <span style={{ color: C.blue, fontWeight: 700 }}>▸ RUN SCAN NOW</span> below. The first scan takes ~5–10s.</li>
+            <li>Look for opportunities <em>without</em> a <Tag label="THIN BOOK" color={C.red} size="xs" /> tag and with a positive <span style={{ color: C.green, fontWeight: 600 }}>Realistic ROI</span>.</li>
+            <li>Click <span style={{ color: C.amber, fontWeight: 700 }}>✎ EXECUTE (PAPER)</span> on a card to journal a simulated fill. Review it later in the Paper Trade tab.</li>
+          </ol>
+          <div style={{ marginTop: 12, fontSize: 11, color: C.dim, fontStyle: "italic" }}>
+            No funds move — paper trading only. See the journal entries' ✓/✗ marks to learn which apparent arbs actually held up at real fill size.
+          </div>
+        </Card>
+      )}
+
+      {/* DEMO-mode banner — Polymarket API was unreachable, scanner is on seeded data */}
+      {apiStat === "demo" && (
+        <Card style={{ padding: "12px 18px" }} accent={C.amber}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <span style={{ fontSize: 18, lineHeight: "20px", color: C.amber }}>⚠</span>
+            <div>
+              <div style={{ fontSize: 12, color: C.amber, fontWeight: 700, letterSpacing: "0.5px", marginBottom: 4 }}>DEMO MODE — POLYMARKET API UNREACHABLE</div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+                Showing seeded sample data, not real prices. Any opportunities below are illustrative — do not paper-trade or real-trade against them. Click RUN SCAN NOW again once your network or Polymarket's CLOB is back.
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Degraded-scan banner — partial detail-fetch failures during the last scan */}
+      {scanStats?.degraded && apiStat === "live" && (
+        <Card style={{ padding: "12px 18px" }} accent={C.amber}>
+          <div style={{ fontSize: 11, color: C.amber, fontWeight: 700, letterSpacing: "0.5px", marginBottom: 4 }}>⚠ PARTIAL SCAN</div>
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+            Polymarket dropped {scanStats.failed} of {scanStats.fetched} market detail fetches ({((scanStats.failed / scanStats.fetched) * 100).toFixed(1)}%). Real arb opportunities in the dropped markets won't appear in the results below. Re-run the scan in a few seconds to retry.
+          </div>
+        </Card>
+      )}
 
       {/* API Config */}
       <Card style={{ padding: "16px 20px" }}>
@@ -944,6 +1145,11 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
             onChange={e => setPaperBudget(parseFloat(e.target.value) || 0)}
             title="USDC notional used by Execute (Paper) per click"
             style={{ width: 100, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.amber, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace" }} />
+          <span style={{ fontSize: 10, color: C.muted, fontFamily: "IBM Plex Mono, monospace", marginLeft: 8 }}>MAX MARKETS</span>
+          <input type="number" min="60" max="5000" step="100" value={maxMarkets}
+            onChange={e => setMaxMarkets(parseInt(e.target.value, 10) || 500)}
+            title="Max active markets pulled per scan. Larger values widen coverage but take longer (≈1s per 100 markets). Hard cap 5000."
+            style={{ width: 100, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, color: C.cyan, padding: "7px 10px", fontSize: 12, outline: "none", fontFamily: "IBM Plex Mono, monospace" }} />
         </div>
       </Card>
 
@@ -996,13 +1202,66 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
         </div>
       </Card>
 
-      {/* Scan Results */}
-      {(crossOpps.length > 0 || nearOpps.length > 0) && (
-        <Card style={{ padding: "16px 20px" }} accent={C.green}>
-          <div style={{ fontSize: 11, color: C.green, fontWeight: 700, letterSpacing: "0.8px", marginBottom: 14 }}>
-            SCAN RESULTS — {crossOpps.length} LOGIC ARB + {nearOpps.length} NEAR-RES OPPORTUNITIES
+      {/* Scan Loading placeholder — only shown while a scan is in flight */}
+      {scanLoading && (
+        <Card style={{ padding: "20px 22px" }} accent={C.blue}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+            <Blink color={C.blue} />
+            <span style={{ fontSize: 12, color: C.blue, fontWeight: 700, letterSpacing: "0.6px" }}>
+              SCANNING {Number(maxMarkets) || 500} MARKETS…
+            </span>
           </div>
-          {crossOpps.slice(0, 3).map(opp => (
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+            Walking the Polymarket CLOB. Larger MAX MARKETS values take longer — at ~1 second per 100 markets, expect roughly {Math.max(1, Math.round((Number(maxMarkets) || 500) / 100))}s.
+          </div>
+        </Card>
+      )}
+
+      {/* Scan Results */}
+      {hasResults && (
+        <Card style={{ padding: "16px 20px" }} accent={C.green}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+            <div style={{ fontSize: 11, color: C.green, fontWeight: 700, letterSpacing: "0.8px" }}>
+              SCAN RESULTS — {crossOpps.length} LOGIC ARB + {nearOpps.length} NEAR-RES OPPORTUNITIES
+            </div>
+            <button onClick={() => setLegendOpen(o => !o)} style={{
+              background: "none", border: `1px solid ${C.border}`, color: C.muted,
+              padding: "3px 9px", borderRadius: 3, fontSize: 10, fontWeight: 600,
+              cursor: "pointer", fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.4px",
+            }}>{legendOpen ? "HIDE LEGEND" : "WHAT DO THESE TAGS MEAN?"}</button>
+          </div>
+          {legendOpen && (
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", marginBottom: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "minmax(120px, max-content) 1fr", gap: "6px 14px", fontSize: 11, lineHeight: 1.5 }}>
+                <Tag label="THRESHOLD" color={C.blue} size="xs" />
+                <span style={{ color: C.muted }}>"X ≥ A" priced higher than "X ≥ B" where A &gt; B — impossible by definition.</span>
+                <Tag label="MUTEX" color={C.purple} size="xs" />
+                <span style={{ color: C.muted }}>Markets in one event whose YES prices sum to &gt;$1. Buy NO on each → guaranteed profit.</span>
+                <Tag label="DOMINANCE" color={C.cyan} size="xs" />
+                <span style={{ color: C.muted }}>"A implies B" but P(A) priced higher than P(B). Hand-curated rules.</span>
+                <Tag label="NEAR-RES" color={C.green} size="xs" />
+                <span style={{ color: C.muted }}>Resolves soon and price is far from 50/50 — short-duration yield play.</span>
+                <Tag label="THIN BOOK" color={C.red} size="xs" />
+                <span style={{ color: C.muted }}>The arb evaporates in the live order book — paper trade will record a loss.</span>
+                <Tag label="LIVE" color={C.green} size="xs" />
+                <span style={{ color: C.muted }}>Pulled from real Polymarket data (not seeded fallback).</span>
+                <Tag label="MULTI-LEG" color={C.amber} size="xs" />
+                <span style={{ color: C.muted }}>Mutex group has 3+ markets — reflected in the rationale text.</span>
+              </div>
+            </div>
+          )}
+          {(showAllCross ? crossOpps : crossOpps.slice(0, 10)).map(opp => {
+            // Realistic depth-checked ROI is the trustworthy number; demote
+            // top-of-book to a small footnote-style tile.
+            const realisticRoi = opp.depthOk === false ? -Math.abs(Number(opp.depthRoi) || 0) : Number(opp.depthRoi);
+            const hasDepth = opp.depthShares != null;
+            const realisticColor = !hasDepth ? C.muted : opp.depthOk ? C.green : C.red;
+            const showApy = opp.daysToExpiry >= 14 && Number.isFinite(Number(opp.apy));
+            const openBoth = () => {
+              if (opp.url1) window.open(opp.url1, "_blank", "noopener");
+              if (opp.url2) window.open(opp.url2, "_blank", "noopener");
+            };
+            return (
             <div key={opp.id} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", marginBottom: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                 <div style={{ flex: 1 }}>
@@ -1017,9 +1276,9 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
                     Leg 1: {opp.leg1?.label} · Leg 2: {opp.leg2?.label}
                   </div>
                   {opp.rationale && <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>{opp.rationale}</div>}
-                  {opp.depthShares != null && (
+                  {hasDepth && (
                     <div style={{ fontSize: 10, color: opp.depthOk ? C.cyan : C.red, fontFamily: "IBM Plex Mono, monospace", marginTop: 2 }}>
-                      Depth: max {opp.depthShares} pairs · realized cost ${opp.depthCost} · profit ${opp.depthProfit} · ROI {opp.depthRoi}%
+                      Depth: max {opp.depthShares} pairs · realized cost ${opp.depthCost} · profit {signedMoney(opp.depthProfit, 2)} · ROI {signedPct(opp.depthRoi, 2)}
                     </div>
                   )}
                   {opp.depthNote && (
@@ -1028,8 +1287,20 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
                     </div>
                   )}
                   <div style={{ marginTop: 6, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-                    {opp.url1 && <a href={opp.url1} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 1 on Polymarket ↗</a>}
-                    {opp.url2 && <a href={opp.url2} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: C.blue, textDecoration: "none", fontFamily: "IBM Plex Mono, monospace" }}>→ Leg 2 on Polymarket ↗</a>}
+                    {(opp.url1 || opp.url2) && (
+                      <button onClick={openBoth} title="Opens both Polymarket legs in new tabs so you can place the trade by hand"
+                        style={{
+                          background: C.blueDim, border: `1px solid ${C.blue}66`, color: C.blue,
+                          padding: "3px 10px", borderRadius: 3, fontSize: 10, fontWeight: 700, cursor: "pointer",
+                          fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.3px",
+                        }}>↗ OPEN BOTH LEGS</button>
+                    )}
+                    <button onClick={() => onBacktestOpp?.(opp)} title="Replay the historical price series for this pair on the Backtest tab"
+                      style={{
+                        background: C.cyanDim, border: `1px solid ${C.cyan}66`, color: C.cyan,
+                        padding: "3px 10px", borderRadius: 3, fontSize: 10, fontWeight: 700, cursor: "pointer",
+                        fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.3px",
+                      }}>⏱ BACKTEST</button>
                     <button onClick={() => executePaper(opp)} disabled={paperBusy === opp.id || !opp.leg1?.tokenId || !opp.leg2?.tokenId} style={{
                       background: opp.depthOk === false ? C.redDim : C.amberDim,
                       border: `1px solid ${opp.depthOk === false ? C.red : C.amber}66`,
@@ -1045,16 +1316,38 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
                     )}
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                  <MetricMini label="Top-Cost" value={money(opp.cost)} color={C.amber} />
-                  <MetricMini label="Top-ROI" value={`+${opp.roi}%`} color={C.green} />
-                  <MetricMini label="APY" value={`${opp.apy}%`} color={C.purple} />
+                <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
+                  <MetricMini label="Cost / pair" value={money(opp.cost)} color={C.amber} />
+                  <div title="Realistic ROI walks the live order book and accounts for slippage. Trust this over Top-of-book.">
+                    <MetricMini
+                      label="Realistic ROI"
+                      value={hasDepth ? signedPct(realisticRoi, 2) : "—"}
+                      color={realisticColor}
+                    />
+                  </div>
+                  <div title="Top-of-book ROI assumes you only buy at the single best ask on each leg. Optimistic; usually evaporates with real size.">
+                    <div style={{ fontSize: 9, color: C.dim, textTransform: "uppercase", letterSpacing: "0.7px", marginBottom: 3 }}>Top-of-book</div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: C.muted, fontFamily: "IBM Plex Mono, monospace", lineHeight: 1 }}>{signedPct(opp.roi, 2)}</div>
+                  </div>
+                  {showApy && (
+                    <div title="Annualized: ROI extrapolated to 365 days. Assumes the same edge repeats daily — usually unrealistic.">
+                      <MetricMini label="Annualized" value={signedPct(opp.apy, 1)} color={C.purple} />
+                    </div>
+                  )}
                   <MetricMini label="Days" value={opp.daysToExpiry} color={C.muted} />
                 </div>
               </div>
             </div>
-          ))}
-          {nearOpps.slice(0, 2).map(opp => (
+            );
+          })}
+          {crossOpps.length > 10 && !showAllCross && (
+            <button onClick={() => setShowAllCross(true)} style={{
+              width: "100%", background: C.surface3, border: `1px solid ${C.border}`,
+              color: C.muted, padding: "8px 0", borderRadius: 4, fontSize: 11, fontWeight: 600,
+              cursor: "pointer", fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.4px", marginBottom: 8,
+            }}>↓ SHOW {crossOpps.length - 10} MORE LOGIC ARB OPPORTUNITIES</button>
+          )}
+          {(showAllNear ? nearOpps : nearOpps.slice(0, 5)).map(opp => (
             <div key={opp.id} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, padding: "10px 14px", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <div>
                 <Tag label="NEAR-RES" color={C.green} size="xs" />
@@ -1063,11 +1356,18 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
               </div>
               <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
                 <MetricMini label="Price" value={pct(opp.price)} color={C.amber} />
-                <MetricMini label="Yield (if YES)" value={`+${opp.roi}%`} color={C.green} />
+                <MetricMini label="Yield (if YES)" value={signedPct(opp.roi, 2)} color={C.green} />
                 <MetricMini label="Days" value={opp.daysToExpiry} color={C.muted} />
               </div>
             </div>
           ))}
+          {nearOpps.length > 5 && !showAllNear && (
+            <button onClick={() => setShowAllNear(true)} style={{
+              width: "100%", background: C.surface3, border: `1px solid ${C.border}`,
+              color: C.muted, padding: "8px 0", borderRadius: 4, fontSize: 11, fontWeight: 600,
+              cursor: "pointer", fontFamily: "IBM Plex Mono, monospace", letterSpacing: "0.4px",
+            }}>↓ SHOW {nearOpps.length - 5} MORE NEAR-RES OPPORTUNITIES</button>
+          )}
         </Card>
       )}
 
@@ -1093,8 +1393,8 @@ function APIFeedSection({ onScanComplete, onPaperTrade }) {
 
 // Kelly Calculator Section
 function KellySection() {
-  const [bankroll, setBankroll] = useState(5000);
-  const [fraction, setFraction] = useState(0.25);
+  const [bankroll, setBankroll] = useLocalStorage("kellyBankroll", 5000);
+  const [fraction, setFraction] = useLocalStorage("kellyFraction", 0.25);
   const [positions, setPositions] = useState([
     { id: 1, label: "BTC >$80K Apr 1 (Near-Res)", prob: 0.94, odds: 1.099, type: "NEAR_RES" },
     { id: 2, label: "CPI <3.5% Mar (Near-Res)", prob: 0.97, odds: 1.053, type: "NEAR_RES" },
@@ -1397,14 +1697,17 @@ function ClaudeMdSection() {
     scanInterval: 5,
   });
   const [copied, setCopied] = useState(false);
+  // Cleanup pending reset-timer on unmount so we don't setState on a dead component.
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(t);
+  }, [copied]);
 
   const md = CLAUDE_MD_TEMPLATE(config);
 
   const copyToClipboard = () => {
-    navigator.clipboard.writeText(md).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
+    navigator.clipboard.writeText(md).then(() => setCopied(true));
   };
 
   const Field = ({ label, field, min, max, step = 1, prefix = "", suffix = "", color = C.amber }) => (
@@ -1607,7 +1910,7 @@ function PaperTradeSection({ journal, setJournal }) {
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
         {[
           ["Open notional", money(totalOpen, 0), C.amber],
-          ["Closed P&L",    `${totalClosed >= 0 ? "+" : ""}${money(totalClosed, 2)}`, totalClosed >= 0 ? C.green : C.red],
+          ["Closed P&L",    signedMoney(totalClosed, 2), totalClosed >= 0 ? C.green : C.red],
           ["Open trades",   journal.filter(e => e.status === "open").length.toString(), C.cyan],
           ["Closed trades", journal.filter(e => e.status === "closed").length.toString(), C.muted],
         ].map(([l, v, c]) => (
@@ -1670,7 +1973,7 @@ function PaperTradeSection({ journal, setJournal }) {
                     <td style={{ padding: "10px 10px", color: C.amber, fontFamily: "IBM Plex Mono, monospace" }}>{money(e.fill.totalCost, 2)}</td>
                     <td style={{ padding: "10px 10px", color: C.muted, fontFamily: "IBM Plex Mono, monospace" }}>{e.realizedAt != null ? money(e.realizedAt, 2) : "—"}</td>
                     <td style={{ padding: "10px 10px", color: e.realizedPnl > 0 ? C.green : e.realizedPnl < 0 ? C.red : C.muted, fontFamily: "IBM Plex Mono, monospace", fontWeight: 700 }}>
-                      {e.realizedPnl != null ? `${e.realizedPnl >= 0 ? "+" : ""}${money(e.realizedPnl, 2)}` : "—"}
+                      {e.realizedPnl != null ? signedMoney(e.realizedPnl, 2) : "—"}
                     </td>
                     <td style={{ padding: "10px 10px", display: "flex", gap: 6 }}>
                       {e.status === "open" && (
@@ -1698,8 +2001,11 @@ function PaperTradeSection({ journal, setJournal }) {
 // existed in the past. The current scanner has known limitations (top-60
 // markets sample, threshold heuristics, hand-curated dominance rules) — the
 // backtest is the only honest way to know whether it ever fires for real.
-function BacktestSection({ opps }) {
-  const [selectedId, setSelectedId] = useState(opps[0]?.id || "");
+function BacktestSection({ opps, preselectedOppId }) {
+  const [selectedId, setSelectedId] = useState(preselectedOppId || opps[0]?.id || "");
+  // If a parent passes a new preselectedOppId (e.g. user clicked "Backtest this opp"
+  // on a scanner card), honour it whenever it changes — overrides any prior choice.
+  useEffect(() => { if (preselectedOppId) setSelectedId(preselectedOppId); }, [preselectedOppId]);
   useEffect(() => { if (!selectedId && opps[0]) setSelectedId(opps[0].id); }, [opps, selectedId]);
   const opp = opps.find(o => o.id === selectedId) || opps[0] || null;
   const [historyRange, setHistoryRange] = useState("1m");
@@ -1822,13 +2128,16 @@ const TABS = [
 ];
 
 export default function ArbBotV2() {
-  const [tab, setTab] = useState("api");
+  const [tab, setTab] = useLocalStorage("tab", "api");
   const [botActive, setBotActive] = useState(false);
   // Counts of real scans completed and the most recent scan's market totals.
   const [scanCount, setScanCount] = useState(0);
   const [lastScan, setLastScan] = useState({ cross: 0, near: 0, status: "unknown" });
   // Lifted so Backtest and Paper-Trade tabs can act on the latest scan's opps.
   const [latestOpps, setLatestOpps] = useState([]);
+  // When the user clicks "Backtest this opp ↗" on a scanner card, this is set
+  // and the active tab is switched. BacktestSection picks it up via prop.
+  const [backtestOppId, setBacktestOppId] = useState("");
   // Paper-trade journal lives at the top so the Scanner can append from a
   // per-opp button while the Paper tab reads the same array. localStorage is
   // the canonical source; React state mirrors it.
@@ -1844,6 +2153,12 @@ export default function ArbBotV2() {
   const addPaperTrade = useCallback((entry) => {
     setPaperJournal(j => [...j, entry]);
   }, []);
+
+  const handleBacktestOpp = useCallback((opp) => {
+    if (!opp?.id) return;
+    setBacktestOppId(opp.id);
+    setTab("backtest");
+  }, [setTab]);
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'IBM Plex Sans', system-ui, sans-serif", fontSize: 14, lineHeight: 1.6 }}>
@@ -1915,8 +2230,8 @@ export default function ArbBotV2() {
 
       {/* Content */}
       <div style={{ padding: "24px", maxWidth: 980, margin: "0 auto" }}>
-        {tab === "api"      && <APIFeedSection onScanComplete={handleScanComplete} onPaperTrade={addPaperTrade} />}
-        {tab === "backtest" && <BacktestSection opps={latestOpps} />}
+        {tab === "api"      && <APIFeedSection onScanComplete={handleScanComplete} onPaperTrade={addPaperTrade} onBacktestOpp={handleBacktestOpp} />}
+        {tab === "backtest" && <BacktestSection opps={latestOpps} preselectedOppId={backtestOppId} />}
         {tab === "paper"    && <PaperTradeSection journal={paperJournal} setJournal={setPaperJournal} />}
         {tab === "kelly"    && <KellySection />}
         {tab === "claude"   && <ClaudeMdSection />}
