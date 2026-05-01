@@ -145,7 +145,8 @@ const FALLBACK_POLY = [
 //   connection caps.
 async function fetchPolymarkets(maxMarkets = 500) {
   const PAGE_SIZE = 500;
-  const DETAIL_CONCURRENCY = 25;
+  const DETAIL_CONCURRENCY = 10; // concurrent /markets/{id} fetches per batch
+  const RETRY_DELAY_MS = 250;    // single retry on transient 429 / 5xx / network blips
   const MAX_PAGES = 50; // hard safety cap (50 × 500 = 25k markets max)
 
   const items = [];
@@ -167,15 +168,35 @@ async function fetchPolymarkets(maxMarkets = 500) {
   }
   const trimmed = items.slice(0, maxMarkets);
 
+  // One-shot retry on transient errors. Polymarket's CLOB doesn't publish a
+  // rate limit but quietly returns 429/503 on bursts above ~10 in-flight; a
+  // single retry after 250ms catches almost all of those.
+  const fetchDetail = async (conditionId) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(`${CLOB_BASE}/markets/${conditionId}`, { headers: { Accept: "application/json" } });
+        if (r.ok) return await r.json();
+        if (attempt === 0 && (r.status === 429 || r.status >= 500)) {
+          await new Promise(res => setTimeout(res, RETRY_DELAY_MS));
+          continue;
+        }
+        return null;
+      } catch {
+        if (attempt === 0) {
+          await new Promise(res => setTimeout(res, RETRY_DELAY_MS));
+          continue;
+        }
+        return null;
+      }
+    }
+    return null;
+  };
+
   const details = new Array(trimmed.length);
   let failedDetails = 0;
   for (let i = 0; i < trimmed.length; i += DETAIL_CONCURRENCY) {
     const chunk = trimmed.slice(i, i + DETAIL_CONCURRENCY);
-    const got = await Promise.all(chunk.map(item =>
-      fetch(`${CLOB_BASE}/markets/${item.condition_id}`, { headers: { Accept: "application/json" } })
-        .then(r => r.ok ? r.json() : null)
-        .catch(() => null)
-    ));
+    const got = await Promise.all(chunk.map(item => fetchDetail(item.condition_id)));
     for (let k = 0; k < got.length; k++) {
       details[i + k] = got[k];
       if (got[k] == null) failedDetails++;
@@ -993,7 +1014,7 @@ function APIFeedSection({ onScanComplete, onPaperTrade, onBacktestOpp }) {
     const pages = Math.ceil(requested / 500);
     setApiLog(prev => [
       { ts: nowTs(), method: "GET", endpoint: `/sampling-simplified-markets ×${pages} pages (limit ${requested})`, status: "...", ms: null, source: "CLOB" },
-      { ts: nowTs(), method: "GET", endpoint: `/markets/{condition_id} ×${requested} (chunked, 25 in flight)`, status: "...", ms: null, source: "CLOB" },
+      { ts: nowTs(), method: "GET", endpoint: `/markets/{condition_id} ×${requested} (chunked, 10 in flight, 1 retry on 429/5xx)`, status: "...", ms: null, source: "CLOB" },
       ...prev,
     ]);
 
@@ -1024,11 +1045,23 @@ function APIFeedSection({ onScanComplete, onPaperTrade, onBacktestOpp }) {
       const failed = stats?.failedDetails || 0;
       const fetched = stats?.fetched || 0;
       const failPct = fetched > 0 ? failed / fetched : 0;
-      const degraded = failPct > 0.05; // surface to user when >5% of detail fetches dropped
+      // Polymarket's CLOB drops 1–2% of requests on a healthy day, even with
+      // retries. Only surface the banner when the failure rate is high enough
+      // to genuinely indicate degraded service (15%+).
+      const degraded = failPct > 0.15;
       setApiLog(prev => {
         const updated = [...prev];
         updated[0] = { ...updated[0], status: 200, ms: Math.round(elapsed * 0.55) };
-        updated[1] = { ...updated[1], status: degraded ? 207 : 200, ms: Math.round(elapsed * 0.65) };
+        updated[1] = {
+          ...updated[1],
+          // Always surface the actual failure count in the detail-fetch line,
+          // even at low rates — degraded just changes the colouring.
+          endpoint: failed > 0
+            ? `/markets/{condition_id} ×${fetched} — ${fetched - failed} ok, ${failed} dropped after retry`
+            : updated[1].endpoint,
+          status: degraded ? 207 : 200,
+          ms: Math.round(elapsed * 0.65),
+        };
         const lines = [];
         if (degraded) {
           lines.push({
